@@ -116,6 +116,53 @@ void test_array_shape_and_view() {
     assert(ident({2, 2}) == 1);
 }
 
+void test_metadata_cache_invalidation() {
+    auto a = litenp::zeros<float>({4});
+    auto a_view = a.view();
+    litenp::fill_view<float>(a_view, 1.0f);
+    expect_close(litenp::sum(a), 4.0f);
+
+    auto b = litenp::zeros<float>({10});
+    auto b_tail = b.view().slice(0, 5, 10);
+    litenp::fill_view<float>(b_tail, 1.0f);
+    expect_close(litenp::sum(b), 5.0f);
+
+    auto c = litenp::zeros<float>({4});
+    auto c_view = c.view();
+    c_view({2}) = 7.0f;
+    expect_close(litenp::sum(c), 7.0f);
+
+    auto d = litenp::zeros<float>({4});
+    auto d_view = d.view();
+    float* d_data = d_view.data();
+    d_data[0] = 3.0f;
+    expect_close(litenp::sum(d), 3.0f);
+
+    const std::size_t n = 300000;
+    std::vector<float> values(n, 1.0f);
+    auto src = litenp::Array<float>::from_vector({n}, values);
+    {
+        auto stale = litenp::zeros<float>({n});
+        expect_close(litenp::sum(stale), 0.0f);
+    }
+    auto copied = src;
+    expect_close(litenp::sum(copied), static_cast<float>(n));
+}
+
+void test_virtual_const_index_values() {
+    const auto arange = litenp::Array<float>::arange(4);
+    const float& first = arange[0];
+    const float& second = arange[1];
+    expect_close(first, 0.0f);
+    expect_close(second, 1.0f);
+
+    const auto ident = litenp::identity<float>(2);
+    const float& diag = ident[0];
+    const float& off_diag = ident[1];
+    expect_close(diag, 1.0f);
+    expect_close(off_diag, 0.0f);
+}
+
 void test_transpose_and_permute() {
     auto a = litenp::Array<float>::from_vector({2, 3}, {1, 2, 3, 4, 5, 6});
     auto t = a.transpose();
@@ -589,10 +636,36 @@ void test_int32() {
     assert(litenp::sum(a) == 10);
 }
 
+void test_api_overload_consistency() {
+    auto a = litenp::Array<float>::from_vector({3}, {1.0f, 2.0f, 4.0f});
+    auto b = 2.0f + a;
+    auto c = 10.0f - a;
+    auto d = 3.0f * a;
+    auto e = 8.0f / a;
+    expect_close(b({2}), 6.0f);
+    expect_close(c({0}), 9.0f);
+    expect_close(d({1}), 6.0f);
+    expect_close(e({2}), 2.0f);
+
+    auto other = litenp::Array<float>::from_vector({3}, {1.0f, 3.0f, 4.0f});
+    auto lt = litenp::less(a, other);
+    auto le = litenp::less_equal(a, other);
+    auto ge = litenp::greater_equal(a, other);
+    auto eq = litenp::equal(a, other);
+    auto ne = litenp::not_equal(a, other);
+    assert(lt({1}) == 1);
+    assert(le({0}) == 1);
+    assert(ge({2}) == 1);
+    assert(eq({0}) == 1);
+    assert(ne({1}) == 1);
+}
+
 }  // namespace
 
 int main() {
     test_array_shape_and_view();
+    test_metadata_cache_invalidation();
+    test_virtual_const_index_values();
     test_transpose_and_permute();
     test_shape_and_dtype_helpers();
     test_broadcast_and_scalar_ops();
@@ -605,6 +678,7 @@ int main() {
     test_fast_path_regressions();
     test_aliasing_guards();
     test_int32();
+    test_api_overload_consistency();
     std::cout << "litenp tests passed\n";
     return 0;
 }

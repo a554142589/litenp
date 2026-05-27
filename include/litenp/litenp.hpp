@@ -42,11 +42,7 @@ extern "C" {
 }
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define LITENP_RESTRICT __restrict__
-#else
 #define LITENP_RESTRICT
-#endif
 
 namespace litenp {
 
@@ -3716,17 +3712,40 @@ public:
     ArrayView() : shape_{0}, strides_{1} {}
 
     ArrayView(T* data, Shape shape, Shape strides)
-        : data_(data), shape_(std::move(shape)), strides_(std::move(strides)) {
+        : ArrayView(data, std::move(shape), std::move(strides), data) {}
+
+    ArrayView(T* data, Shape shape, Shape strides, T* base_data)
+        : data_(data), base_data_(base_data), shape_(std::move(shape)), strides_(std::move(strides)) {
         detail::require(shape_.size() == strides_.size(), "shape/stride rank mismatch");
     }
 
     template <typename U = T, typename = std::enable_if_t<!std::is_const<U>::value>>
     operator ArrayView<const U>() const {
-        return ArrayView<const U>(data_, shape_, strides_);
+        return ArrayView<const U>(data_, shape_, strides_, base_data_);
+    }
+
+    template <typename U = T, typename = std::enable_if_t<!std::is_const<U>::value>>
+    U* data() {
+        invalidate_metadata();
+        return data_;
     }
 
     T* data() const {
+        invalidate_metadata();
         return data_;
+    }
+
+    void invalidate_metadata() const {
+        if constexpr (!std::is_const<T>::value) {
+            if (metadata_invalidated_) {
+                return;
+            }
+            detail::clear_uniform(data_);
+            if (base_data_ != data_) {
+                detail::clear_uniform(base_data_);
+            }
+            metadata_invalidated_ = true;
+        }
     }
 
     const Shape& shape() const {
@@ -3760,6 +3779,7 @@ public:
     }
 
     T& at(const Shape& index) const {
+        invalidate_metadata();
         return data_[offset(index)];
     }
 
@@ -3770,7 +3790,7 @@ public:
     ArrayView<T> reshape(Shape new_shape) const {
         detail::require(is_contiguous(), "reshape currently requires a contiguous view");
         detail::require(numel(new_shape) == size(), "reshape cannot change element count");
-        return ArrayView<T>(data_, std::move(new_shape), detail::contiguous_strides(new_shape));
+        return ArrayView<T>(data_, std::move(new_shape), detail::contiguous_strides(new_shape), base_data_);
     }
 
     ArrayView<T> flatten() const {
@@ -3789,7 +3809,7 @@ public:
         Shape out_strides = strides_;
         out_shape[axis] = (end - begin + step - 1) / step;
         out_strides[axis] *= step;
-        return ArrayView<T>(data_ + begin * strides_[axis], std::move(out_shape), std::move(out_strides));
+        return ArrayView<T>(data_ + begin * strides_[axis], std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> select(std::size_t axis, std::size_t index) const {
@@ -3803,7 +3823,7 @@ public:
             out_shape.push_back(1);
             out_strides.push_back(1);
         }
-        return ArrayView<T>(data_ + index * strides_[axis], std::move(out_shape), std::move(out_strides));
+        return ArrayView<T>(data_ + index * strides_[axis], std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> permute(const Shape& axes) const {
@@ -3819,7 +3839,7 @@ public:
             out_shape[i] = shape_[axis];
             out_strides[i] = strides_[axis];
         }
-        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides));
+        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> transpose() const {
@@ -3843,7 +3863,7 @@ public:
             out_shape.push_back(1);
             out_strides.push_back(1);
         }
-        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides));
+        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> squeeze(std::size_t axis) const {
@@ -3857,7 +3877,7 @@ public:
             out_shape.push_back(1);
             out_strides.push_back(1);
         }
-        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides));
+        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> unsqueeze(std::size_t axis) const {
@@ -3867,13 +3887,15 @@ public:
         const std::size_t stride = axis < ndim() ? strides_[axis] * shape_[axis] : 1;
         out_shape.insert(out_shape.begin() + static_cast<std::ptrdiff_t>(axis), 1);
         out_strides.insert(out_strides.begin() + static_cast<std::ptrdiff_t>(axis), stride);
-        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides));
+        return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides), base_data_);
     }
 
 private:
     T* data_ = nullptr;
+    T* base_data_ = nullptr;
     Shape shape_;
     Shape strides_;
+    mutable bool metadata_invalidated_ = false;
 };
 
 namespace detail {
@@ -4001,6 +4023,7 @@ struct NoInitAllocator : std::allocator<T> {
         if (p == nullptr) {
             return;
         }
+        clear_uniform(p);
         const std::size_t bytes = n * sizeof(T);
         constexpr std::size_t alignment = alignof(T) > 32 ? alignof(T) : 32;
         if (mode_ == AllocationMode::Zeroed) {
@@ -4159,24 +4182,22 @@ public:
         return storage_[i];
     }
 
-    const T& operator[](std::size_t i) const {
+    T operator[](std::size_t i) const {
         if (virtual_uniform_) {
             return virtual_value_;
         }
         if (virtual_arange_) {
-            virtual_sample_ = virtual_start_ + static_cast<T>(i) * virtual_step_;
-            return virtual_sample_;
+            return virtual_start_ + static_cast<T>(i) * virtual_step_;
         }
         if (virtual_eye_) {
-            virtual_sample_ = T{};
             if (shape_.size() == 2 && shape_[1] != 0) {
                 const std::size_t row = i / shape_[1];
                 const std::size_t col = i - row * shape_[1];
                 if (row == col && row < shape_[0]) {
-                    virtual_sample_ = T{1};
+                    return T{1};
                 }
             }
-            return virtual_sample_;
+            return T{};
         }
         if (virtual_two_block_) {
             return i < virtual_split_ ? virtual_value_ : virtual_second_;
@@ -4202,12 +4223,12 @@ public:
 
     ArrayView<T> view() {
         materialize_virtual();
-        return ArrayView<T>(storage_.data(), shape_, strides_);
+        return ArrayView<T>(storage_.data(), shape_, strides_, storage_.data());
     }
 
     ArrayView<const T> view() const {
         materialize_virtual();
-        return ArrayView<const T>(storage_.data(), shape_, strides_);
+        return ArrayView<const T>(storage_.data(), shape_, strides_, storage_.data());
     }
 
     ArrayView<T> reshape(Shape new_shape) {
@@ -4396,7 +4417,6 @@ private:
     mutable T virtual_value_{};
     mutable T virtual_start_{};
     mutable T virtual_step_{1};
-    mutable T virtual_sample_{};
     mutable std::size_t virtual_split_ = 0;
     mutable T virtual_second_{};
 };
@@ -4535,6 +4555,7 @@ inline bool copy_2d_strided_to_contiguous(ArrayView<const T> view, T* out) {
 
 template <typename T>
 Array<T> zeros(Shape shape) {
+    static_assert(std::is_arithmetic<T>::value, "litenp::zeros<T> requires an arithmetic element type");
     return detail::make_zeroed_array<T>(std::move(shape));
 }
 
@@ -5278,6 +5299,28 @@ Array<T> operator/(const Array<T>& a, T scalar) {
 }
 
 template <typename T>
+Array<T> operator+(T scalar, const Array<T>& a) {
+    return a + scalar;
+}
+
+template <typename T>
+Array<T> operator-(T scalar, const Array<T>& a) {
+    Array<T> scalar_array({1}, scalar);
+    return binary<T>(scalar_array.view(), a.view(), detail::BinaryOp::Sub);
+}
+
+template <typename T>
+Array<T> operator*(T scalar, const Array<T>& a) {
+    return a * scalar;
+}
+
+template <typename T>
+Array<T> operator/(T scalar, const Array<T>& a) {
+    Array<T> scalar_array({1}, scalar);
+    return binary<T>(scalar_array.view(), a.view(), detail::BinaryOp::Div);
+}
+
+template <typename T>
 Array<std::uint8_t> compare(ArrayView<const T> a, ArrayView<const T> b, detail::CompareOp op) {
     const Shape out_shape = detail::broadcast_shape(a.shape(), b.shape());
     Array<std::uint8_t> out = detail::make_uninitialized_array<std::uint8_t>(out_shape);
@@ -5386,6 +5429,31 @@ Array<std::uint8_t> not_equal(ArrayView<const T> a, ArrayView<const T> b) {
 template <typename T>
 Array<std::uint8_t> greater(const Array<T>& a, const Array<T>& b) {
     return greater<T>(a.view(), b.view());
+}
+
+template <typename T>
+Array<std::uint8_t> less(const Array<T>& a, const Array<T>& b) {
+    return less<T>(a.view(), b.view());
+}
+
+template <typename T>
+Array<std::uint8_t> less_equal(const Array<T>& a, const Array<T>& b) {
+    return less_equal<T>(a.view(), b.view());
+}
+
+template <typename T>
+Array<std::uint8_t> greater_equal(const Array<T>& a, const Array<T>& b) {
+    return greater_equal<T>(a.view(), b.view());
+}
+
+template <typename T>
+Array<std::uint8_t> equal(const Array<T>& a, const Array<T>& b) {
+    return equal<T>(a.view(), b.view());
+}
+
+template <typename T>
+Array<std::uint8_t> not_equal(const Array<T>& a, const Array<T>& b) {
+    return not_equal<T>(a.view(), b.view());
 }
 
 template <typename T>
