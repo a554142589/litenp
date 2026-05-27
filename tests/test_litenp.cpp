@@ -642,10 +642,14 @@ void test_api_overload_consistency() {
     auto c = 10.0f - a;
     auto d = 3.0f * a;
     auto e = 8.0f / a;
+    auto f = 2 + a;
+    auto g = a + 2;
     expect_close(b({2}), 6.0f);
     expect_close(c({0}), 9.0f);
     expect_close(d({1}), 6.0f);
     expect_close(e({2}), 2.0f);
+    expect_close(f({1}), 4.0f);
+    expect_close(g({2}), 6.0f);
 
     auto other = litenp::Array<float>::from_vector({3}, {1.0f, 3.0f, 4.0f});
     auto lt = litenp::less(a, other);

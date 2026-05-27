@@ -5298,6 +5298,62 @@ Array<T> operator/(const Array<T>& a, T scalar) {
     return binary_scalar<T>(a.view(), scalar, detail::BinaryOp::Div);
 }
 
+template <
+    typename T,
+    typename Scalar,
+    typename R = std::common_type_t<T, Scalar>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
+Array<R> operator+(const Array<T>& a, Scalar scalar) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(a.view(), scalar_array.view(), detail::BinaryOp::Add);
+    } else {
+        return add<T, R, R>(a.view(), scalar_array.view());
+    }
+}
+
+template <
+    typename T,
+    typename Scalar,
+    typename R = std::common_type_t<T, Scalar>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
+Array<R> operator-(const Array<T>& a, Scalar scalar) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(a.view(), scalar_array.view(), detail::BinaryOp::Sub);
+    } else {
+        return subtract<T, R, R>(a.view(), scalar_array.view());
+    }
+}
+
+template <
+    typename T,
+    typename Scalar,
+    typename R = std::common_type_t<T, Scalar>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
+Array<R> operator*(const Array<T>& a, Scalar scalar) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(a.view(), scalar_array.view(), detail::BinaryOp::Mul);
+    } else {
+        return multiply<T, R, R>(a.view(), scalar_array.view());
+    }
+}
+
+template <
+    typename T,
+    typename Scalar,
+    typename R = std::common_type_t<T, Scalar>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
+Array<R> operator/(const Array<T>& a, Scalar scalar) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(a.view(), scalar_array.view(), detail::BinaryOp::Div);
+    } else {
+        return divide<T, R, R>(a.view(), scalar_array.view());
+    }
+}
+
 template <typename T>
 Array<T> operator+(T scalar, const Array<T>& a) {
     return a + scalar;
@@ -5318,6 +5374,62 @@ template <typename T>
 Array<T> operator/(T scalar, const Array<T>& a) {
     Array<T> scalar_array({1}, scalar);
     return binary<T>(scalar_array.view(), a.view(), detail::BinaryOp::Div);
+}
+
+template <
+    typename Scalar,
+    typename T,
+    typename R = std::common_type_t<Scalar, T>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
+Array<R> operator+(Scalar scalar, const Array<T>& a) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(scalar_array.view(), a.view(), detail::BinaryOp::Add);
+    } else {
+        return add<R, T, R>(scalar_array.view(), a.view());
+    }
+}
+
+template <
+    typename Scalar,
+    typename T,
+    typename R = std::common_type_t<Scalar, T>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
+Array<R> operator-(Scalar scalar, const Array<T>& a) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(scalar_array.view(), a.view(), detail::BinaryOp::Sub);
+    } else {
+        return subtract<R, T, R>(scalar_array.view(), a.view());
+    }
+}
+
+template <
+    typename Scalar,
+    typename T,
+    typename R = std::common_type_t<Scalar, T>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
+Array<R> operator*(Scalar scalar, const Array<T>& a) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(scalar_array.view(), a.view(), detail::BinaryOp::Mul);
+    } else {
+        return multiply<R, T, R>(scalar_array.view(), a.view());
+    }
+}
+
+template <
+    typename Scalar,
+    typename T,
+    typename R = std::common_type_t<Scalar, T>,
+    typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
+Array<R> operator/(Scalar scalar, const Array<T>& a) {
+    Array<R> scalar_array({1}, static_cast<R>(scalar));
+    if constexpr (std::is_same<T, R>::value) {
+        return binary<R>(scalar_array.view(), a.view(), detail::BinaryOp::Div);
+    } else {
+        return divide<R, T, R>(scalar_array.view(), a.view());
+    }
 }
 
 template <typename T>
