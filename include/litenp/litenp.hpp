@@ -8,12 +8,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <new>
 #include <numeric>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -28,7 +30,7 @@
 #endif
 #endif
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
 #endif
 
@@ -434,7 +436,8 @@ enum class BinaryOp {
     Mul,
     Div,
     Min,
-    Max
+    Max,
+    Pow
 };
 
 enum class CompareOp {
@@ -452,7 +455,17 @@ enum class UnaryOp {
     Relu,
     Sqrt,
     Exp,
-    Sigmoid
+    Sigmoid,
+    Log,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Tanh,
+    Floor,
+    Ceil,
+    Round
 };
 
 template <typename T>
@@ -470,6 +483,8 @@ inline T apply_binary(T a, T b, BinaryOp op) {
             return std::min(a, b);
         case BinaryOp::Max:
             return std::max(a, b);
+        case BinaryOp::Pow:
+            return static_cast<T>(std::pow(static_cast<double>(a), static_cast<double>(b)));
     }
     return T{};
 }
@@ -510,6 +525,26 @@ inline T apply_unary(T x, UnaryOp op) {
             const double xd = static_cast<double>(x);
             return static_cast<T>(1.0 / (1.0 + std::exp(-xd)));
         }
+        case UnaryOp::Log:
+            return static_cast<T>(std::log(static_cast<double>(x)));
+        case UnaryOp::Log2:
+            return static_cast<T>(std::log2(static_cast<double>(x)));
+        case UnaryOp::Log10:
+            return static_cast<T>(std::log10(static_cast<double>(x)));
+        case UnaryOp::Sin:
+            return static_cast<T>(std::sin(static_cast<double>(x)));
+        case UnaryOp::Cos:
+            return static_cast<T>(std::cos(static_cast<double>(x)));
+        case UnaryOp::Tan:
+            return static_cast<T>(std::tan(static_cast<double>(x)));
+        case UnaryOp::Tanh:
+            return static_cast<T>(std::tanh(static_cast<double>(x)));
+        case UnaryOp::Floor:
+            return static_cast<T>(std::floor(static_cast<double>(x)));
+        case UnaryOp::Ceil:
+            return static_cast<T>(std::ceil(static_cast<double>(x)));
+        case UnaryOp::Round:
+            return static_cast<T>(std::round(static_cast<double>(x)));
     }
     return T{};
 }
@@ -794,6 +829,88 @@ inline void add_row_broadcast_contiguous_serial(
     T* LITENP_RESTRICT out,
     std::size_t rows,
     std::size_t cols) {
+#if defined(__AVX512F__)
+    if constexpr (std::is_same<T, float>::value) {
+        std::size_t r = 0;
+        const std::size_t row_block_end = rows - rows % 4;
+        const bool aligned =
+            cols % 16 == 0 &&
+            is_aligned_to(matrix, 64) &&
+            is_aligned_to(row, 64) &&
+            is_aligned_to(out, 64);
+        const bool stream_output = aligned && out != matrix && out != row && rows * cols >= (1u << 22);
+        for (; r < row_block_end; r += 4) {
+            const float* m0 = matrix + (r + 0) * cols;
+            const float* m1 = matrix + (r + 1) * cols;
+            const float* m2 = matrix + (r + 2) * cols;
+            const float* m3 = matrix + (r + 3) * cols;
+            float* o0 = out + (r + 0) * cols;
+            float* o1 = out + (r + 1) * cols;
+            float* o2 = out + (r + 2) * cols;
+            float* o3 = out + (r + 3) * cols;
+            std::size_t c = 0;
+            const std::size_t vec_end = cols - cols % 16;
+            if (stream_output) {
+                for (; c < vec_end; c += 16) {
+                    const __m512 rv = _mm512_load_ps(row + c);
+                    _mm512_stream_ps(o0 + c, _mm512_add_ps(_mm512_load_ps(m0 + c), rv));
+                    _mm512_stream_ps(o1 + c, _mm512_add_ps(_mm512_load_ps(m1 + c), rv));
+                    _mm512_stream_ps(o2 + c, _mm512_add_ps(_mm512_load_ps(m2 + c), rv));
+                    _mm512_stream_ps(o3 + c, _mm512_add_ps(_mm512_load_ps(m3 + c), rv));
+                }
+            } else if (aligned) {
+                for (; c < vec_end; c += 16) {
+                    const __m512 rv = _mm512_load_ps(row + c);
+                    _mm512_store_ps(o0 + c, _mm512_add_ps(_mm512_load_ps(m0 + c), rv));
+                    _mm512_store_ps(o1 + c, _mm512_add_ps(_mm512_load_ps(m1 + c), rv));
+                    _mm512_store_ps(o2 + c, _mm512_add_ps(_mm512_load_ps(m2 + c), rv));
+                    _mm512_store_ps(o3 + c, _mm512_add_ps(_mm512_load_ps(m3 + c), rv));
+                }
+            } else {
+                for (; c < vec_end; c += 16) {
+                    const __m512 rv = _mm512_loadu_ps(row + c);
+                    _mm512_storeu_ps(o0 + c, _mm512_add_ps(_mm512_loadu_ps(m0 + c), rv));
+                    _mm512_storeu_ps(o1 + c, _mm512_add_ps(_mm512_loadu_ps(m1 + c), rv));
+                    _mm512_storeu_ps(o2 + c, _mm512_add_ps(_mm512_loadu_ps(m2 + c), rv));
+                    _mm512_storeu_ps(o3 + c, _mm512_add_ps(_mm512_loadu_ps(m3 + c), rv));
+                }
+            }
+            for (; c < cols; ++c) {
+                const float rv = row[c];
+                o0[c] = m0[c] + rv;
+                o1[c] = m1[c] + rv;
+                o2[c] = m2[c] + rv;
+                o3[c] = m3[c] + rv;
+            }
+        }
+        for (; r < rows; ++r) {
+            const float* m = matrix + r * cols;
+            float* o = out + r * cols;
+            std::size_t c = 0;
+            const std::size_t vec_end = cols - cols % 16;
+            if (stream_output) {
+                for (; c < vec_end; c += 16) {
+                    _mm512_stream_ps(o + c, _mm512_add_ps(_mm512_load_ps(m + c), _mm512_load_ps(row + c)));
+                }
+            } else if (aligned) {
+                for (; c < vec_end; c += 16) {
+                    _mm512_store_ps(o + c, _mm512_add_ps(_mm512_load_ps(m + c), _mm512_load_ps(row + c)));
+                }
+            } else {
+                for (; c < vec_end; c += 16) {
+                    _mm512_storeu_ps(o + c, _mm512_add_ps(_mm512_loadu_ps(m + c), _mm512_loadu_ps(row + c)));
+                }
+            }
+            for (; c < cols; ++c) {
+                o[c] = m[c] + row[c];
+            }
+        }
+        if (stream_output) {
+            _mm_sfence();
+        }
+        return;
+    }
+#endif
 #if defined(__AVX2__)
     if constexpr (std::is_same<T, float>::value) {
         std::size_t r = 0;
@@ -1314,6 +1431,47 @@ inline __m256 exp256_ps(__m256 x) {
 }
 #endif
 
+#if defined(__AVX512F__)
+inline __m512 exp512_ps(__m512 x) {
+    const __m512 original = x;
+    const __m512 exp_hi = _mm512_set1_ps(88.3762626647949f);
+    const __m512 exp_lo = _mm512_set1_ps(-88.3762626647949f);
+    const __m512 maxlog = _mm512_set1_ps(88.72283905206835f);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 one = _mm512_set1_ps(1.0f);
+
+    x = _mm512_min_ps(x, exp_hi);
+    x = _mm512_max_ps(x, exp_lo);
+
+    __m512 fx = _mm512_add_ps(_mm512_mul_ps(x, _mm512_set1_ps(1.44269504088896341f)), _mm512_set1_ps(0.5f));
+    fx = _mm512_floor_ps(fx);
+
+    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(0.693359375f), x);
+    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.12194440e-4f), x);
+
+    const __m512 z = _mm512_mul_ps(x, x);
+    __m512 y = _mm512_set1_ps(1.9875691500E-4f);
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.3981999507E-3f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(8.3334519073E-3f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(4.1665795894E-2f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.6666665459E-1f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(5.0000001201E-1f));
+    y = _mm512_fmadd_ps(y, z, x);
+    y = _mm512_add_ps(y, one);
+
+    __m512i emm0 = _mm512_cvttps_epi32(fx);
+    emm0 = _mm512_add_epi32(emm0, _mm512_set1_epi32(0x7f));
+    emm0 = _mm512_slli_epi32(emm0, 23);
+    y = _mm512_mul_ps(y, _mm512_castsi512_ps(emm0));
+
+    const __mmask16 overflow = _mm512_cmp_ps_mask(original, maxlog, _CMP_GT_OQ);
+    const __mmask16 underflow = _mm512_cmp_ps_mask(original, _mm512_set1_ps(-103.97208404541016f), _CMP_LT_OQ);
+    y = _mm512_mask_blend_ps(overflow, y, _mm512_set1_ps(std::numeric_limits<float>::infinity()));
+    y = _mm512_mask_blend_ps(underflow, y, zero);
+    return y;
+}
+#endif
+
 template <typename T>
 inline void unary_contiguous(const T* a, T* out, std::size_t n, UnaryOp op) {
     T uniform{};
@@ -1335,6 +1493,64 @@ inline void unary_contiguous(const T* a, T* out, std::size_t n, UnaryOp op) {
             unary_contiguous(a + begin, out + begin, end - begin, op);
         }
         return;
+    }
+#endif
+#if defined(__AVX512F__)
+    if constexpr (std::is_same<T, float>::value) {
+        if (op == UnaryOp::Exp || op == UnaryOp::Sigmoid) {
+            std::size_t i = 0;
+            const __m512 one = _mm512_set1_ps(1.0f);
+            const std::size_t block_end = n - n % 64;
+            const bool aligned = is_aligned_to(a, 64) && is_aligned_to(out, 64);
+            const bool stream_output = aligned && out != a && n >= (1u << 22);
+            auto apply_vec = [&](const __m512 x) {
+                if (op == UnaryOp::Exp) return exp512_ps(x);
+                return _mm512_div_ps(one, _mm512_add_ps(one, exp512_ps(_mm512_sub_ps(_mm512_setzero_ps(), x))));
+            };
+            if (stream_output) {
+                for (; i < block_end; i += 64) {
+                    _mm512_stream_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                    _mm512_stream_ps(out + i + 16, apply_vec(_mm512_load_ps(a + i + 16)));
+                    _mm512_stream_ps(out + i + 32, apply_vec(_mm512_load_ps(a + i + 32)));
+                    _mm512_stream_ps(out + i + 48, apply_vec(_mm512_load_ps(a + i + 48)));
+                }
+                const std::size_t vec_end = n - n % 16;
+                for (; i < vec_end; i += 16) {
+                    _mm512_stream_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                }
+                _mm_sfence();
+            } else if (aligned) {
+                for (; i < block_end; i += 64) {
+                    _mm512_store_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                    _mm512_store_ps(out + i + 16, apply_vec(_mm512_load_ps(a + i + 16)));
+                    _mm512_store_ps(out + i + 32, apply_vec(_mm512_load_ps(a + i + 32)));
+                    _mm512_store_ps(out + i + 48, apply_vec(_mm512_load_ps(a + i + 48)));
+                }
+            } else {
+                for (; i < block_end; i += 64) {
+                    _mm512_storeu_ps(out + i, apply_vec(_mm512_loadu_ps(a + i)));
+                    _mm512_storeu_ps(out + i + 16, apply_vec(_mm512_loadu_ps(a + i + 16)));
+                    _mm512_storeu_ps(out + i + 32, apply_vec(_mm512_loadu_ps(a + i + 32)));
+                    _mm512_storeu_ps(out + i + 48, apply_vec(_mm512_loadu_ps(a + i + 48)));
+                }
+            }
+            const std::size_t vec_end = n - n % 16;
+            if (!stream_output) {
+                if (aligned) {
+                    for (; i < vec_end; i += 16) {
+                        _mm512_store_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                    }
+                } else {
+                    for (; i < vec_end; i += 16) {
+                        _mm512_storeu_ps(out + i, apply_vec(_mm512_loadu_ps(a + i)));
+                    }
+                }
+            }
+            for (; i < n; ++i) {
+                out[i] = apply_unary(a[i], op);
+            }
+            return;
+        }
     }
 #endif
 #if defined(__AVX2__)
@@ -3988,7 +4204,7 @@ struct NoInitAllocator : std::allocator<T> {
             throw std::bad_array_new_length();
         }
         const std::size_t bytes = n * sizeof(T);
-        constexpr std::size_t alignment = alignof(T) > 32 ? alignof(T) : 32;
+        constexpr std::size_t alignment = alignof(T) > 64 ? alignof(T) : 64;
         if (mode_ == AllocationMode::Zeroed) {
 #if defined(__unix__) || defined(__APPLE__)
             if (bytes >= 4096) {
@@ -4029,7 +4245,7 @@ struct NoInitAllocator : std::allocator<T> {
         }
         clear_uniform(p);
         const std::size_t bytes = n * sizeof(T);
-        constexpr std::size_t alignment = alignof(T) > 32 ? alignof(T) : 32;
+        constexpr std::size_t alignment = alignof(T) > 64 ? alignof(T) : 64;
         if (mode_ == AllocationMode::Zeroed) {
 #if defined(__unix__) || defined(__APPLE__)
             if (bytes >= 4096) {
@@ -4223,6 +4439,14 @@ public:
 
     const T& operator()(std::initializer_list<std::size_t> index) const {
         return at(Shape(index));
+    }
+
+    T& operator[](const Shape& index) {
+        return at(index);
+    }
+
+    const T& operator[](const Shape& index) const {
+        return at(index);
     }
 
     ArrayView<T> view() {
@@ -4634,6 +4858,175 @@ Array<T> identity(std::size_t n) {
 }
 
 template <typename T>
+std::ostream& operator<<(std::ostream& os, const Array<T>& a) {
+    const auto& shape = a.shape();
+    if (shape.empty()) {
+        os << "[]";
+        return os;
+    }
+    if (shape.size() == 1) {
+        os << "[";
+        for (std::size_t i = 0; i < shape[0]; ++i) {
+            if (i > 0) os << ", ";
+            os << a[i];
+        }
+        os << "]";
+        return os;
+    }
+    if (shape.size() == 2) {
+        os << "[";
+        for (std::size_t r = 0; r < shape[0]; ++r) {
+            if (r > 0) os << "\n ";
+            os << "[";
+            for (std::size_t c = 0; c < shape[1]; ++c) {
+                if (c > 0) os << ", ";
+                os << a[Shape{r, c}];
+            }
+            os << "]";
+        }
+        os << "]";
+        return os;
+    }
+    os << "Array(shape={";
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) os << ", ";
+        os << shape[i];
+    }
+    os << "})";
+    return os;
+}
+
+template <typename T>
+T dot(ArrayView<const T> a, ArrayView<const T> b) {
+    detail::require(a.ndim() == 1 && b.ndim() == 1, "dot requires 1D arrays");
+    detail::require(a.size() == b.size(), "dot requires equal lengths");
+    T acc = T{};
+    const T* ad = a.data();
+    const T* bd = b.data();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        acc += ad[i] * bd[i];
+    }
+    return acc;
+}
+
+template <typename T>
+T dot(const Array<T>& a, const Array<T>& b) {
+    return dot<T>(a.view(), b.view());
+}
+
+template <typename T>
+Array<T> outer(ArrayView<const T> a, ArrayView<const T> b) {
+    detail::require(a.ndim() == 1 && b.ndim() == 1, "outer requires 1D arrays");
+    Array<T> out = detail::make_uninitialized_array<T>({a.size(), b.size()});
+    const T* ad = a.data();
+    const T* bd = b.data();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const T ai = ad[i];
+        for (std::size_t j = 0; j < b.size(); ++j) {
+            out[Shape{i, j}] = ai * bd[j];
+        }
+    }
+    return out;
+}
+
+template <typename T>
+Array<T> outer(const Array<T>& a, const Array<T>& b) {
+    return outer<T>(a.view(), b.view());
+}
+
+namespace detail {
+inline bool write_little_endian(std::ostream& os, const void* data, std::size_t bytes) {
+    os.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+    return os.good();
+}
+}  // namespace detail
+
+template <typename T>
+bool save(const Array<T>& a, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    const char magic[6] = {'\x93', 'N', 'U', 'M', 'P', 'Y'};
+    f.write(magic, 6);
+    f.put(1);
+    f.put(0);
+    std::string dtype;
+    if constexpr (std::is_same<T, float>::value) dtype = "<f4";
+    else if constexpr (std::is_same<T, double>::value) dtype = "<f8";
+    else if constexpr (std::is_same<T, std::int32_t>::value) dtype = "<i4";
+    else if constexpr (std::is_same<T, std::int64_t>::value) dtype = "<i8";
+    else dtype = "|V" + std::to_string(sizeof(T));
+    std::string shape_str;
+    for (std::size_t i = 0; i < a.shape().size(); ++i) {
+        if (i > 0) shape_str += ", ";
+        shape_str += std::to_string(a.shape()[i]);
+    }
+    std::string header = "{'descr': '" + dtype + "', 'fortran_order': False, 'shape': (" + shape_str;
+    if (a.shape().size() == 1) header += ",";
+    header += "), }";
+    std::size_t total = 10 + header.size();
+    std::size_t pad = (16 - (total % 16)) % 16;
+    header.append(pad, ' ');
+    header.push_back('\n');
+    std::uint16_t header_len = static_cast<std::uint16_t>(header.size());
+    f.write(reinterpret_cast<const char*>(&header_len), 2);
+    f.write(header.data(), static_cast<std::streamsize>(header.size()));
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        T val = a[i];
+        f.write(reinterpret_cast<const char*>(&val), sizeof(T));
+    }
+    return f.good();
+}
+
+template <typename T>
+Array<T> load(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open file: " + path);
+    char magic[6];
+    f.read(magic, 6);
+    if (std::string(magic, 6) != std::string("\x93NUMPY", 6)) {
+        throw std::runtime_error("not a .npy file");
+    }
+    char major, minor;
+    f.get(major);
+    f.get(minor);
+    std::uint16_t header_len = 0;
+    if (major == 1) {
+        f.read(reinterpret_cast<char*>(&header_len), 2);
+    } else {
+        std::uint32_t h32 = 0;
+        f.read(reinterpret_cast<char*>(&h32), 4);
+        header_len = static_cast<std::uint16_t>(h32);
+    }
+    std::string header(header_len, '\0');
+    f.read(&header[0], header_len);
+    Shape shape;
+    auto pos = header.find("'shape': (");
+    if (pos != std::string::npos) {
+        auto start = pos + 10;
+        auto end = header.find(')', start);
+        std::string dims = header.substr(start, end - start);
+        std::size_t i = 0;
+        while (i < dims.size()) {
+            while (i < dims.size() && (dims[i] == ' ' || dims[i] == ',')) ++i;
+            std::size_t j = i;
+            while (j < dims.size() && dims[j] >= '0' && dims[j] <= '9') ++j;
+            if (j > i) shape.push_back(static_cast<std::size_t>(std::stoull(dims.substr(i, j - i))));
+            i = j;
+        }
+    }
+    if (shape.empty()) shape.push_back(0);
+    std::size_t total = 1;
+    for (auto d : shape) total *= d;
+    Array<T> out = detail::make_uninitialized_array<T>(shape);
+    for (std::size_t i = 0; i < total; ++i) {
+        T val{};
+        f.read(reinterpret_cast<char*>(&val), sizeof(T));
+        out[i] = val;
+    }
+    return out;
+}
+
+template <typename T>
 Array<T> as_contiguous(ArrayView<const T> view) {
     T uniform{};
     if (detail::known_uniform_value(view.data(), view.size(), &uniform)) {
@@ -4824,6 +5217,10 @@ void binary_into(ArrayView<const T> a, ArrayView<const T> b, ArrayView<T> out, d
 
 template <typename To, typename From>
 Array<To> astype(ArrayView<const From> view) {
+    From uniform{};
+    if (view.is_contiguous() && detail::known_uniform_value(view.data(), view.size(), &uniform)) {
+        return detail::make_uniform_array<To>(view.shape(), static_cast<To>(uniform));
+    }
     Array<To> out = detail::make_uninitialized_array<To>(view.shape());
     To* out_data = out.data();
     if (view.is_contiguous()) {
@@ -4933,6 +5330,56 @@ Array<T> sigmoid(ArrayView<const T> a) {
 }
 
 template <typename T>
+Array<T> log(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Log);
+}
+
+template <typename T>
+Array<T> log2(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Log2);
+}
+
+template <typename T>
+Array<T> log10(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Log10);
+}
+
+template <typename T>
+Array<T> sin(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Sin);
+}
+
+template <typename T>
+Array<T> cos(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Cos);
+}
+
+template <typename T>
+Array<T> tan(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Tan);
+}
+
+template <typename T>
+Array<T> tanh(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Tanh);
+}
+
+template <typename T>
+Array<T> floor(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Floor);
+}
+
+template <typename T>
+Array<T> ceil(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Ceil);
+}
+
+template <typename T>
+Array<T> round(ArrayView<const T> a) {
+    return unary<T>(a, detail::UnaryOp::Round);
+}
+
+template <typename T>
 Array<T> negative(const Array<T>& a) {
     return negative<T>(a.view());
 }
@@ -4961,6 +5408,27 @@ template <typename T>
 Array<T> sigmoid(const Array<T>& a) {
     return sigmoid<T>(a.view());
 }
+
+template <typename T>
+Array<T> log(const Array<T>& a) { return log<T>(a.view()); }
+template <typename T>
+Array<T> log2(const Array<T>& a) { return log2<T>(a.view()); }
+template <typename T>
+Array<T> log10(const Array<T>& a) { return log10<T>(a.view()); }
+template <typename T>
+Array<T> sin(const Array<T>& a) { return sin<T>(a.view()); }
+template <typename T>
+Array<T> cos(const Array<T>& a) { return cos<T>(a.view()); }
+template <typename T>
+Array<T> tan(const Array<T>& a) { return tan<T>(a.view()); }
+template <typename T>
+Array<T> tanh(const Array<T>& a) { return tanh<T>(a.view()); }
+template <typename T>
+Array<T> floor(const Array<T>& a) { return floor<T>(a.view()); }
+template <typename T>
+Array<T> ceil(const Array<T>& a) { return ceil<T>(a.view()); }
+template <typename T>
+Array<T> round(const Array<T>& a) { return round<T>(a.view()); }
 
 template <typename T>
 Array<T> binary(ArrayView<const T> a, ArrayView<const T> b, detail::BinaryOp op) {
@@ -5210,6 +5678,16 @@ Array<T> minimum(ArrayView<const T> a, ArrayView<const T> b) {
 template <typename T>
 Array<T> maximum(ArrayView<const T> a, ArrayView<const T> b) {
     return binary(a, b, detail::BinaryOp::Max);
+}
+
+template <typename T>
+Array<T> power(ArrayView<const T> a, ArrayView<const T> b) {
+    return binary(a, b, detail::BinaryOp::Pow);
+}
+
+template <typename T>
+Array<T> power(const Array<T>& a, const Array<T>& b) {
+    return power<T>(a.view(), b.view());
 }
 
 template <typename T>
@@ -5576,6 +6054,14 @@ template <typename T>
 void clip_into(ArrayView<const T> a, T low, T high, ArrayView<T> out) {
     detail::require(low <= high, "clip low must be <= high");
     detail::require(out.shape() == a.shape(), "clip output shape mismatch");
+    T uniform{};
+    if (a.is_contiguous() && out.is_contiguous() &&
+        detail::known_uniform_value(a.data(), a.size(), &uniform)) {
+        const T result = std::min(std::max(uniform, low), high);
+        detail::fill_contiguous(out.data(), result, out.size());
+        detail::mark_uniform(out.data(), out.size(), result);
+        return;
+    }
     detail::clear_uniform(out.data());
     if (detail::memory_may_overlap(out, a) && !detail::same_view(out, a)) {
         Array<T> tmp = detail::make_uninitialized_array<T>(out.shape());
@@ -5612,6 +6098,26 @@ void where_into(ArrayView<const std::uint8_t> mask, ArrayView<const T> x, ArrayV
     const Shape xy_shape = detail::broadcast_shape(x.shape(), y.shape());
     const Shape out_shape = detail::broadcast_shape(mask.shape(), xy_shape);
     detail::require(out.shape() == out_shape, "where output shape mismatch");
+    std::uint8_t mask_uniform{};
+    if (mask.is_contiguous() &&
+        detail::known_uniform_value(mask.data(), mask.size(), &mask_uniform)) {
+        if (out.is_contiguous() && mask_uniform != 0 && x.is_contiguous() && x.shape() == out_shape) {
+            T u{};
+            std::memcpy(out.data(), x.data(), out.size() * sizeof(T));
+            if (detail::known_uniform_value(x.data(), x.size(), &u)) {
+                detail::mark_uniform(out.data(), out.size(), u);
+            }
+            return;
+        }
+        if (out.is_contiguous() && mask_uniform == 0 && y.is_contiguous() && y.shape() == out_shape) {
+            T u{};
+            std::memcpy(out.data(), y.data(), out.size() * sizeof(T));
+            if (detail::known_uniform_value(y.data(), y.size(), &u)) {
+                detail::mark_uniform(out.data(), out.size(), u);
+            }
+            return;
+        }
+    }
     detail::clear_uniform(out.data());
     const bool exact_x = detail::same_view(out, x);
     const bool exact_y = detail::same_view(out, y);
@@ -6018,6 +6524,12 @@ template <typename T>
 Array<double> mean(ArrayView<const T> a, std::size_t axis) {
     detail::require(axis < a.ndim(), "axis out of range");
     detail::require(a.shape()[axis] > 0, "mean of empty axis");
+    T uniform{};
+    if (a.is_contiguous() && detail::known_uniform_value(a.data(), a.size(), &uniform)) {
+        Array<double> out = detail::make_uniform_array<double>(reduced_shape(a.shape(), axis),
+                                                                static_cast<double>(uniform));
+        return out;
+    }
     Array<T> totals = sum(a, axis);
     Array<double> out = detail::make_uninitialized_array<double>(totals.shape());
     const double denom = static_cast<double>(a.shape()[axis]);
@@ -6037,6 +6549,12 @@ Array<T> max(ArrayView<const T> a, std::size_t axis) {
     detail::require(axis < a.ndim(), "axis out of range");
     detail::require(a.shape()[axis] > 0, "max of empty axis");
     Array<T> out = detail::make_uninitialized_array<T>(reduced_shape(a.shape(), axis));
+    T uniform{};
+    if (a.is_contiguous() && detail::known_uniform_value(a.data(), a.size(), &uniform)) {
+        detail::fill_contiguous(out.data(), uniform, out.size());
+        detail::mark_uniform(out.data(), out.size(), uniform);
+        return out;
+    }
     if (a.is_contiguous() && a.ndim() == 2) {
         const std::size_t rows = a.shape()[0];
         const std::size_t cols = a.shape()[1];
@@ -6086,6 +6604,123 @@ Array<T> max(ArrayView<const T> a, std::size_t axis) {
 template <typename T>
 Array<T> max(const Array<T>& a, std::size_t axis) {
     return max<T>(a.view(), axis);
+}
+
+template <typename T>
+Array<std::size_t> argmin(ArrayView<const T> a, std::size_t axis) {
+    detail::require(axis < a.ndim(), "axis out of range");
+    detail::require(a.shape()[axis] > 0, "argmin of empty axis");
+    Array<std::size_t> out = detail::make_uninitialized_array<std::size_t>(reduced_shape(a.shape(), axis));
+    Shape out_index;
+    Shape in_index(a.ndim(), 0);
+    for (std::size_t out_linear = 0; out_linear < out.size(); ++out_linear) {
+        detail::linear_to_index(out_linear, out.shape(), out_index);
+        std::size_t out_axis = 0;
+        for (std::size_t in_axis = 0; in_axis < a.ndim(); ++in_axis) {
+            if (in_axis == axis) {
+                in_index[in_axis] = 0;
+            } else {
+                in_index[in_axis] = out_index[out_axis++];
+            }
+        }
+        T best = a.data()[detail::offset_for_index(in_index, a.strides())];
+        std::size_t best_idx = 0;
+        for (std::size_t k = 1; k < a.shape()[axis]; ++k) {
+            in_index[axis] = k;
+            const T val = a.data()[detail::offset_for_index(in_index, a.strides())];
+            if (val < best) {
+                best = val;
+                best_idx = k;
+            }
+        }
+        out[out_linear] = best_idx;
+    }
+    return out;
+}
+
+template <typename T>
+Array<std::size_t> argmin(const Array<T>& a, std::size_t axis) {
+    return argmin<T>(a.view(), axis);
+}
+
+template <typename T>
+Array<std::size_t> argmax(ArrayView<const T> a, std::size_t axis) {
+    detail::require(axis < a.ndim(), "axis out of range");
+    detail::require(a.shape()[axis] > 0, "argmax of empty axis");
+    Array<std::size_t> out = detail::make_uninitialized_array<std::size_t>(reduced_shape(a.shape(), axis));
+    Shape out_index;
+    Shape in_index(a.ndim(), 0);
+    for (std::size_t out_linear = 0; out_linear < out.size(); ++out_linear) {
+        detail::linear_to_index(out_linear, out.shape(), out_index);
+        std::size_t out_axis = 0;
+        for (std::size_t in_axis = 0; in_axis < a.ndim(); ++in_axis) {
+            if (in_axis == axis) {
+                in_index[in_axis] = 0;
+            } else {
+                in_index[in_axis] = out_index[out_axis++];
+            }
+        }
+        T best = a.data()[detail::offset_for_index(in_index, a.strides())];
+        std::size_t best_idx = 0;
+        for (std::size_t k = 1; k < a.shape()[axis]; ++k) {
+            in_index[axis] = k;
+            const T val = a.data()[detail::offset_for_index(in_index, a.strides())];
+            if (val > best) {
+                best = val;
+                best_idx = k;
+            }
+        }
+        out[out_linear] = best_idx;
+    }
+    return out;
+}
+
+template <typename T>
+Array<std::size_t> argmax(const Array<T>& a, std::size_t axis) {
+    return argmax<T>(a.view(), axis);
+}
+
+template <typename T>
+Array<T> cumsum(ArrayView<const T> a, std::size_t axis) {
+    detail::require(axis < a.ndim(), "axis out of range");
+    Array<T> out = detail::make_uninitialized_array<T>(a.shape());
+    const std::size_t axis_len = a.shape()[axis];
+    Shape out_index;
+    Shape in_index(a.ndim(), 0);
+    for (std::size_t out_linear = 0; out_linear < out.size(); ++out_linear) {
+        detail::linear_to_index(out_linear, out.shape(), out_index);
+        for (std::size_t d = 0; d < a.ndim(); ++d) {
+            in_index[d] = out_index[d];
+        }
+        T acc = T{};
+        for (std::size_t k = 0; k <= out_index[axis]; ++k) {
+            in_index[axis] = k;
+            acc += a.data()[detail::offset_for_index(in_index, a.strides())];
+        }
+        out[out_linear] = acc;
+    }
+    return out;
+}
+
+template <typename T>
+Array<T> cumsum(const Array<T>& a, std::size_t axis) {
+    return cumsum<T>(a.view(), axis);
+}
+
+template <typename T>
+Array<T> softmax(ArrayView<const T> a, std::size_t axis) {
+    detail::require(axis < a.ndim(), "axis out of range");
+    detail::require(a.shape()[axis] > 0, "softmax of empty axis");
+    const Array<T> mx = max(a, axis);
+    const Array<T> shifted = subtract(a, mx.view());
+    const Array<T> exp_val = exp(shifted.view());
+    const Array<T> denom = sum(exp_val.view(), axis);
+    return divide(exp_val.view(), denom.view());
+}
+
+template <typename T>
+Array<T> softmax(const Array<T>& a, std::size_t axis) {
+    return softmax<T>(a.view(), axis);
 }
 
 template <typename T>
