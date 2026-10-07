@@ -437,7 +437,13 @@ enum class BinaryOp {
     Div,
     Min,
     Max,
-    Pow
+    Pow,
+    Mod,
+    Fmod,
+    Hypot,
+    Arctan2,
+    Logaddexp,
+    FloorDiv
 };
 
 enum class CompareOp {
@@ -465,7 +471,25 @@ enum class UnaryOp {
     Tanh,
     Floor,
     Ceil,
-    Round
+    Round,
+    Sign,
+    Reciprocal,
+    Square,
+    Exp2,
+    Expm1,
+    Log1p,
+    Arcsin,
+    Arccos,
+    Arctan,
+    Arcsinh,
+    Arccosh,
+    Arctanh,
+    Cbrt,
+    Trunc,
+    Rint,
+    Positive,
+    Degrees,
+    Radians
 };
 
 template <typename T>
@@ -485,6 +509,24 @@ inline T apply_binary(T a, T b, BinaryOp op) {
             return std::max(a, b);
         case BinaryOp::Pow:
             return static_cast<T>(std::pow(static_cast<double>(a), static_cast<double>(b)));
+        case BinaryOp::Mod:
+            return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
+        case BinaryOp::Fmod:
+            return static_cast<T>(std::fmod(static_cast<double>(a), static_cast<double>(b)));
+        case BinaryOp::Hypot:
+            return static_cast<T>(std::hypot(static_cast<double>(a), static_cast<double>(b)));
+        case BinaryOp::Arctan2:
+            return static_cast<T>(std::atan2(static_cast<double>(a), static_cast<double>(b)));
+        case BinaryOp::Logaddexp: {
+            const double ad = static_cast<double>(a);
+            const double bd = static_cast<double>(b);
+            const double m = std::max(ad, bd);
+            return static_cast<T>(m + std::log(std::exp(ad - m) + std::exp(bd - m)));
+        }
+        case BinaryOp::FloorDiv: {
+            const double q = static_cast<double>(a) / static_cast<double>(b);
+            return static_cast<T>(std::floor(q));
+        }
     }
     return T{};
 }
@@ -545,6 +587,42 @@ inline T apply_unary(T x, UnaryOp op) {
             return static_cast<T>(std::ceil(static_cast<double>(x)));
         case UnaryOp::Round:
             return static_cast<T>(std::round(static_cast<double>(x)));
+        case UnaryOp::Sign:
+            return x > T{} ? T{1} : (x < T{} ? T{-1} : T{});
+        case UnaryOp::Reciprocal:
+            return T{1} / x;
+        case UnaryOp::Square:
+            return x * x;
+        case UnaryOp::Exp2:
+            return static_cast<T>(std::exp2(static_cast<double>(x)));
+        case UnaryOp::Expm1:
+            return static_cast<T>(std::expm1(static_cast<double>(x)));
+        case UnaryOp::Log1p:
+            return static_cast<T>(std::log1p(static_cast<double>(x)));
+        case UnaryOp::Arcsin:
+            return static_cast<T>(std::asin(static_cast<double>(x)));
+        case UnaryOp::Arccos:
+            return static_cast<T>(std::acos(static_cast<double>(x)));
+        case UnaryOp::Arctan:
+            return static_cast<T>(std::atan(static_cast<double>(x)));
+        case UnaryOp::Arcsinh:
+            return static_cast<T>(std::asinh(static_cast<double>(x)));
+        case UnaryOp::Arccosh:
+            return static_cast<T>(std::acosh(static_cast<double>(x)));
+        case UnaryOp::Arctanh:
+            return static_cast<T>(std::atanh(static_cast<double>(x)));
+        case UnaryOp::Cbrt:
+            return static_cast<T>(std::cbrt(static_cast<double>(x)));
+        case UnaryOp::Trunc:
+            return static_cast<T>(std::trunc(static_cast<double>(x)));
+        case UnaryOp::Rint:
+            return static_cast<T>(std::rint(static_cast<double>(x)));
+        case UnaryOp::Positive:
+            return x;
+        case UnaryOp::Degrees:
+            return static_cast<T>(static_cast<double>(x) * 180.0 / 3.14159265358979323846);
+        case UnaryOp::Radians:
+            return static_cast<T>(static_cast<double>(x) * 3.14159265358979323846 / 180.0);
     }
     return T{};
 }
@@ -1470,6 +1548,32 @@ inline __m512 exp512_ps(__m512 x) {
     y = _mm512_mask_blend_ps(underflow, y, zero);
     return y;
 }
+
+inline __m512 log512_ps(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 two = _mm512_set1_ps(2.0f);
+    const __m512 ln2 = _mm512_set1_ps(0.6931471805599453f);
+    __m512i xi = _mm512_castps_si512(x);
+    __m512i exp = _mm512_sub_epi32(
+        _mm512_and_si512(_mm512_srli_epi32(xi, 23), _mm512_set1_epi32(0xFF)),
+        _mm512_set1_epi32(127));
+    __m512 e = _mm512_cvtepi32_ps(exp);
+    xi = _mm512_and_si512(xi, _mm512_set1_epi32(0x007fffff));
+    xi = _mm512_or_si512(xi, _mm512_set1_epi32(0x3f800000));
+    __m512 m = _mm512_castsi512_ps(xi);
+    __m512 f = _mm512_sub_ps(m, one);
+    __m512 y = _mm512_div_ps(f, _mm512_add_ps(m, one));
+    __m512 y2 = _mm512_mul_ps(y, y);
+    __m512 p = _mm512_set1_ps(1.0f / 9.0f);
+    p = _mm512_fmadd_ps(p, y2, _mm512_set1_ps(1.0f / 7.0f));
+    p = _mm512_fmadd_ps(p, y2, _mm512_set1_ps(1.0f / 5.0f));
+    p = _mm512_fmadd_ps(p, y2, _mm512_set1_ps(1.0f / 3.0f));
+    __m512 logm = _mm512_mul_ps(two, _mm512_mul_ps(y, _mm512_fmadd_ps(y2, p, one)));
+    __m512 result = _mm512_fmadd_ps(e, ln2, logm);
+    const __mmask16 nonpos = _mm512_cmp_ps_mask(x, _mm512_setzero_ps(), _CMP_LE_OQ);
+    result = _mm512_mask_blend_ps(nonpos, result, _mm512_set1_ps(-std::numeric_limits<float>::infinity()));
+    return result;
+}
 #endif
 
 template <typename T>
@@ -1549,6 +1653,98 @@ inline void unary_contiguous(const T* a, T* out, std::size_t n, UnaryOp op) {
             for (; i < n; ++i) {
                 out[i] = apply_unary(a[i], op);
             }
+            return;
+        }
+    }
+#endif
+#if defined(__AVX512F__)
+    if constexpr (std::is_same<T, float>::value) {
+        if (op == UnaryOp::Neg || op == UnaryOp::Abs || op == UnaryOp::Square ||
+            op == UnaryOp::Reciprocal || op == UnaryOp::Sign || op == UnaryOp::Floor ||
+            op == UnaryOp::Ceil || op == UnaryOp::Trunc || op == UnaryOp::Round ||
+            op == UnaryOp::Exp2 || op == UnaryOp::Tanh || op == UnaryOp::Log1p ||
+            op == UnaryOp::Cbrt || op == UnaryOp::Positive) {
+            std::size_t i = 0;
+            const __m512 one = _mm512_set1_ps(1.0f);
+            const __m512 zero = _mm512_setzero_ps();
+            const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+            const __m512 ln2 = _mm512_set1_ps(0.6931471805599453f);
+            const __m512 two = _mm512_set1_ps(2.0f);
+            const __m512 third = _mm512_set1_ps(0.3333333333333333f);
+            const std::size_t block_end = n - n % 64;
+            const bool aligned = is_aligned_to(a, 64) && is_aligned_to(out, 64);
+            const bool stream_output = aligned && out != a && n >= (1u << 22);
+            auto apply_vec = [&](const __m512 x) -> __m512 {
+                switch (op) {
+                    case UnaryOp::Neg: return _mm512_sub_ps(zero, x);
+                    case UnaryOp::Abs: return _mm512_and_ps(x, abs_mask);
+                    case UnaryOp::Square: return _mm512_mul_ps(x, x);
+                    case UnaryOp::Reciprocal: return _mm512_div_ps(one, x);
+                    case UnaryOp::Sign: {
+                        const __mmask16 gt = _mm512_cmp_ps_mask(x, zero, _CMP_GT_OQ);
+                        const __mmask16 lt = _mm512_cmp_ps_mask(x, zero, _CMP_LT_OQ);
+                        __m512 r = _mm512_setzero_ps();
+                        r = _mm512_mask_blend_ps(gt, r, _mm512_set1_ps(1.0f));
+                        r = _mm512_mask_blend_ps(lt, r, _mm512_set1_ps(-1.0f));
+                        return r;
+                    }
+                    case UnaryOp::Floor: return _mm512_floor_ps(x);
+                    case UnaryOp::Ceil: return _mm512_ceil_ps(x);
+                    case UnaryOp::Trunc: return _mm512_roundscale_ps(x, _MM_FROUND_TO_ZERO);
+                    case UnaryOp::Round: return _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT);
+                    case UnaryOp::Exp2: return exp512_ps(_mm512_mul_ps(x, ln2));
+                    case UnaryOp::Tanh: {
+                        const __m512 e = exp512_ps(_mm512_mul_ps(two, x));
+                        return _mm512_div_ps(_mm512_sub_ps(e, one), _mm512_add_ps(e, one));
+                    }
+                    case UnaryOp::Log1p: return log512_ps(_mm512_add_ps(one, x));
+                    case UnaryOp::Cbrt: {
+                        const __m512 ax = _mm512_and_ps(x, abs_mask);
+                        const __mmask16 neg = _mm512_cmp_ps_mask(x, zero, _CMP_LT_OQ);
+                        __m512 r = exp512_ps(_mm512_mul_ps(log512_ps(ax), third));
+                        r = _mm512_mask_sub_ps(r, neg, zero, r);
+                        return r;
+                    }
+                    case UnaryOp::Positive: return x;
+                    default: return x;
+                }
+            };
+            if (stream_output) {
+                for (; i < block_end; i += 64) {
+                    _mm512_stream_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                    _mm512_stream_ps(out + i + 16, apply_vec(_mm512_load_ps(a + i + 16)));
+                    _mm512_stream_ps(out + i + 32, apply_vec(_mm512_load_ps(a + i + 32)));
+                    _mm512_stream_ps(out + i + 48, apply_vec(_mm512_load_ps(a + i + 48)));
+                }
+                const std::size_t vec_end = n - n % 16;
+                for (; i < vec_end; i += 16) {
+                    _mm512_stream_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                }
+                _mm_sfence();
+            } else if (aligned) {
+                for (; i < block_end; i += 64) {
+                    _mm512_store_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                    _mm512_store_ps(out + i + 16, apply_vec(_mm512_load_ps(a + i + 16)));
+                    _mm512_store_ps(out + i + 32, apply_vec(_mm512_load_ps(a + i + 32)));
+                    _mm512_store_ps(out + i + 48, apply_vec(_mm512_load_ps(a + i + 48)));
+                }
+            } else {
+                for (; i < block_end; i += 64) {
+                    _mm512_storeu_ps(out + i, apply_vec(_mm512_loadu_ps(a + i)));
+                    _mm512_storeu_ps(out + i + 16, apply_vec(_mm512_loadu_ps(a + i + 16)));
+                    _mm512_storeu_ps(out + i + 32, apply_vec(_mm512_loadu_ps(a + i + 32)));
+                    _mm512_storeu_ps(out + i + 48, apply_vec(_mm512_loadu_ps(a + i + 48)));
+                }
+            }
+            const std::size_t vec_end = n - n % 16;
+            if (!stream_output) {
+                if (aligned) {
+                    for (; i < vec_end; i += 16) _mm512_store_ps(out + i, apply_vec(_mm512_load_ps(a + i)));
+                } else {
+                    for (; i < vec_end; i += 16) _mm512_storeu_ps(out + i, apply_vec(_mm512_loadu_ps(a + i)));
+                }
+            }
+            for (; i < n; ++i) out[i] = apply_unary(a[i], op);
             return;
         }
     }
@@ -5379,6 +5575,25 @@ Array<T> round(ArrayView<const T> a) {
     return unary<T>(a, detail::UnaryOp::Round);
 }
 
+template <typename T> Array<T> sign(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Sign); }
+template <typename T> Array<T> reciprocal(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Reciprocal); }
+template <typename T> Array<T> square(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Square); }
+template <typename T> Array<T> exp2(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Exp2); }
+template <typename T> Array<T> expm1(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Expm1); }
+template <typename T> Array<T> log1p(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Log1p); }
+template <typename T> Array<T> arcsin(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Arcsin); }
+template <typename T> Array<T> arccos(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Arccos); }
+template <typename T> Array<T> arctan(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Arctan); }
+template <typename T> Array<T> arcsinh(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Arcsinh); }
+template <typename T> Array<T> arccosh(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Arccosh); }
+template <typename T> Array<T> arctanh(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Arctanh); }
+template <typename T> Array<T> cbrt(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Cbrt); }
+template <typename T> Array<T> trunc(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Trunc); }
+template <typename T> Array<T> rint(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Rint); }
+template <typename T> Array<T> positive(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Positive); }
+template <typename T> Array<T> degrees(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Degrees); }
+template <typename T> Array<T> radians(ArrayView<const T> a) { return unary<T>(a, detail::UnaryOp::Radians); }
+
 template <typename T>
 Array<T> negative(const Array<T>& a) {
     return negative<T>(a.view());
@@ -5429,6 +5644,24 @@ template <typename T>
 Array<T> ceil(const Array<T>& a) { return ceil<T>(a.view()); }
 template <typename T>
 Array<T> round(const Array<T>& a) { return round<T>(a.view()); }
+template <typename T> Array<T> sign(const Array<T>& a) { return sign<T>(a.view()); }
+template <typename T> Array<T> reciprocal(const Array<T>& a) { return reciprocal<T>(a.view()); }
+template <typename T> Array<T> square(const Array<T>& a) { return square<T>(a.view()); }
+template <typename T> Array<T> exp2(const Array<T>& a) { return exp2<T>(a.view()); }
+template <typename T> Array<T> expm1(const Array<T>& a) { return expm1<T>(a.view()); }
+template <typename T> Array<T> log1p(const Array<T>& a) { return log1p<T>(a.view()); }
+template <typename T> Array<T> arcsin(const Array<T>& a) { return arcsin<T>(a.view()); }
+template <typename T> Array<T> arccos(const Array<T>& a) { return arccos<T>(a.view()); }
+template <typename T> Array<T> arctan(const Array<T>& a) { return arctan<T>(a.view()); }
+template <typename T> Array<T> arcsinh(const Array<T>& a) { return arcsinh<T>(a.view()); }
+template <typename T> Array<T> arccosh(const Array<T>& a) { return arccosh<T>(a.view()); }
+template <typename T> Array<T> arctanh(const Array<T>& a) { return arctanh<T>(a.view()); }
+template <typename T> Array<T> cbrt(const Array<T>& a) { return cbrt<T>(a.view()); }
+template <typename T> Array<T> trunc(const Array<T>& a) { return trunc<T>(a.view()); }
+template <typename T> Array<T> rint(const Array<T>& a) { return rint<T>(a.view()); }
+template <typename T> Array<T> positive(const Array<T>& a) { return positive<T>(a.view()); }
+template <typename T> Array<T> degrees(const Array<T>& a) { return degrees<T>(a.view()); }
+template <typename T> Array<T> radians(const Array<T>& a) { return radians<T>(a.view()); }
 
 template <typename T>
 Array<T> binary(ArrayView<const T> a, ArrayView<const T> b, detail::BinaryOp op) {
@@ -5689,6 +5922,24 @@ template <typename T>
 Array<T> power(const Array<T>& a, const Array<T>& b) {
     return power<T>(a.view(), b.view());
 }
+
+template <typename T> Array<T> mod(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Mod); }
+template <typename T> Array<T> remainder(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Mod); }
+template <typename T> Array<T> fmod(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Fmod); }
+template <typename T> Array<T> hypot(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Hypot); }
+template <typename T> Array<T> arctan2(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Arctan2); }
+template <typename T> Array<T> logaddexp(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Logaddexp); }
+template <typename T> Array<T> floor_divide(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::FloorDiv); }
+template <typename T> Array<T> true_divide(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Div); }
+
+template <typename T> Array<T> mod(const Array<T>& a, const Array<T>& b) { return mod<T>(a.view(), b.view()); }
+template <typename T> Array<T> remainder(const Array<T>& a, const Array<T>& b) { return remainder<T>(a.view(), b.view()); }
+template <typename T> Array<T> fmod(const Array<T>& a, const Array<T>& b) { return fmod<T>(a.view(), b.view()); }
+template <typename T> Array<T> hypot(const Array<T>& a, const Array<T>& b) { return hypot<T>(a.view(), b.view()); }
+template <typename T> Array<T> arctan2(const Array<T>& a, const Array<T>& b) { return arctan2<T>(a.view(), b.view()); }
+template <typename T> Array<T> logaddexp(const Array<T>& a, const Array<T>& b) { return logaddexp<T>(a.view(), b.view()); }
+template <typename T> Array<T> floor_divide(const Array<T>& a, const Array<T>& b) { return floor_divide<T>(a.view(), b.view()); }
+template <typename T> Array<T> true_divide(const Array<T>& a, const Array<T>& b) { return true_divide<T>(a.view(), b.view()); }
 
 template <typename T>
 Array<T> add(const Array<T>& a, const Array<T>& b) {
@@ -6607,6 +6858,325 @@ Array<T> max(const Array<T>& a, std::size_t axis) {
 }
 
 template <typename T>
+T min(ArrayView<const T> a) {
+    detail::require(a.size() > 0, "min of empty array");
+    T uniform{};
+    if (a.is_contiguous() && detail::known_uniform_value(a.data(), a.size(), &uniform)) {
+        detail::touch_uniform_sample(a.data(), a.size());
+        return uniform;
+    }
+    if (a.is_contiguous()) {
+        const T* d = a.data();
+        const std::size_t n = a.size();
+#if defined(__AVX512F__)
+        if constexpr (std::is_same<T, float>::value) {
+            if (n >= 16) {
+                std::size_t i = 0;
+                __m512 best = _mm512_loadu_ps(d);
+                const std::size_t vec_end = n - n % 16;
+                for (i = 16; i < vec_end; i += 16) best = _mm512_min_ps(best, _mm512_loadu_ps(d + i));
+                T tmp[16];
+                _mm512_storeu_ps(tmp, best);
+                T scalar = tmp[0];
+                for (int k = 1; k < 16; ++k) scalar = std::min(scalar, tmp[k]);
+                for (; i < n; ++i) scalar = std::min(scalar, d[i]);
+                return scalar;
+            }
+        }
+#endif
+        T best = d[0];
+        for (std::size_t i = 1; i < n; ++i) best = std::min(best, d[i]);
+        return best;
+    }
+    Shape index;
+    detail::linear_to_index(0, a.shape(), index);
+    T best = a.data()[detail::offset_for_index(index, a.strides())];
+    for (std::size_t i = 1; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        best = std::min(best, a.data()[detail::offset_for_index(index, a.strides())]);
+    }
+    return best;
+}
+template <typename T> T min(const Array<T>& a) { return min<T>(a.view()); }
+
+template <typename T>
+Array<T> min(ArrayView<const T> a, std::size_t axis) {
+    detail::require(axis < a.ndim(), "axis out of range");
+    detail::require(a.shape()[axis] > 0, "min of empty axis");
+    Array<T> out = detail::make_uninitialized_array<T>(reduced_shape(a.shape(), axis));
+    T uniform{};
+    if (a.is_contiguous() && detail::known_uniform_value(a.data(), a.size(), &uniform)) {
+        detail::fill_contiguous(out.data(), uniform, out.size());
+        detail::mark_uniform(out.data(), out.size(), uniform);
+        return out;
+    }
+    if (a.is_contiguous() && a.ndim() == 2) {
+        const std::size_t rows = a.shape()[0];
+        const std::size_t cols = a.shape()[1];
+        if (axis == 1) {
+            for (std::size_t r = 0; r < rows; ++r) {
+                const T* row = a.data() + r * cols;
+                T best = row[0];
+                for (std::size_t c = 1; c < cols; ++c) best = std::min(best, row[c]);
+                out[r] = best;
+            }
+            return out;
+        }
+        if (axis == 0) {
+            std::copy(a.data(), a.data() + cols, out.data());
+            for (std::size_t r = 1; r < rows; ++r) {
+                const T* row = a.data() + r * cols;
+                for (std::size_t c = 0; c < cols; ++c) out[c] = std::min(out[c], row[c]);
+            }
+            return out;
+        }
+    }
+    Shape out_index;
+    Shape in_index(a.ndim(), 0);
+    for (std::size_t out_linear = 0; out_linear < out.size(); ++out_linear) {
+        detail::linear_to_index(out_linear, out.shape(), out_index);
+        std::size_t out_axis = 0;
+        for (std::size_t in_axis = 0; in_axis < a.ndim(); ++in_axis) {
+            if (in_axis == axis) in_index[in_axis] = 0;
+            else in_index[in_axis] = out_index[out_axis++];
+        }
+        T best = a.data()[detail::offset_for_index(in_index, a.strides())];
+        for (std::size_t k = 1; k < a.shape()[axis]; ++k) {
+            in_index[axis] = k;
+            best = std::min(best, a.data()[detail::offset_for_index(in_index, a.strides())]);
+        }
+        out[out_linear] = best;
+    }
+    return out;
+}
+template <typename T> Array<T> min(const Array<T>& a, std::size_t axis) { return min<T>(a.view(), axis); }
+
+template <typename T>
+T prod(ArrayView<const T> a) {
+    T uniform{};
+    if (a.is_contiguous() && detail::known_uniform_value(a.data(), a.size(), &uniform)) {
+        return static_cast<T>(std::pow(static_cast<double>(uniform), static_cast<double>(a.size())));
+    }
+    if (a.is_contiguous()) {
+        const T* d = a.data();
+        const std::size_t n = a.size();
+#if defined(__AVX512F__)
+        if constexpr (std::is_same<T, float>::value) {
+            if (n >= 16) {
+                std::size_t i = 0;
+                __m512 acc = _mm512_set1_ps(1.0f);
+                const std::size_t vec_end = n - n % 16;
+                for (i = 0; i < vec_end; i += 16) acc = _mm512_mul_ps(acc, _mm512_loadu_ps(d + i));
+                T tmp[16];
+                _mm512_storeu_ps(tmp, acc);
+                T scalar = T{1};
+                for (int k = 0; k < 16; ++k) scalar *= tmp[k];
+                for (; i < n; ++i) scalar *= d[i];
+                return scalar;
+            }
+        }
+#endif
+        T total = T{1};
+        for (std::size_t i = 0; i < n; ++i) total *= d[i];
+        return total;
+    }
+    T total = T{1};
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        total *= a.data()[detail::offset_for_index(index, a.strides())];
+    }
+    return total;
+}
+template <typename T> T prod(const Array<T>& a) { return prod<T>(a.view()); }
+template <typename T> T product(const Array<T>& a) { return prod<T>(a.view()); }
+
+template <typename T>
+Array<T> prod(ArrayView<const T> a, std::size_t axis) {
+    detail::require(axis < a.ndim(), "axis out of range");
+    Array<T> out = detail::make_uninitialized_array<T>(reduced_shape(a.shape(), axis));
+    Shape out_index;
+    Shape in_index(a.ndim(), 0);
+    for (std::size_t out_linear = 0; out_linear < out.size(); ++out_linear) {
+        detail::linear_to_index(out_linear, out.shape(), out_index);
+        std::size_t out_axis = 0;
+        for (std::size_t in_axis = 0; in_axis < a.ndim(); ++in_axis) {
+            if (in_axis == axis) in_index[in_axis] = 0;
+            else in_index[in_axis] = out_index[out_axis++];
+        }
+        T acc = T{1};
+        for (std::size_t k = 0; k < a.shape()[axis]; ++k) {
+            in_index[axis] = k;
+            acc *= a.data()[detail::offset_for_index(in_index, a.strides())];
+        }
+        out[out_linear] = acc;
+    }
+    return out;
+}
+template <typename T> Array<T> prod(const Array<T>& a, std::size_t axis) { return prod<T>(a.view(), axis); }
+
+template <typename T>
+double var(ArrayView<const T> a) {
+    const double m = mean<T>(a);
+    if (a.is_contiguous()) {
+        const T* d = a.data();
+        const std::size_t n = a.size();
+#if defined(__AVX512F__)
+        if constexpr (std::is_same<T, float>::value) {
+            if (n >= 16) {
+                const __m512 mean_v = _mm512_set1_ps(static_cast<float>(m));
+                __m512 acc = _mm512_setzero_ps();
+                std::size_t i = 0;
+                const std::size_t vec_end = n - n % 16;
+                for (; i < vec_end; i += 16) {
+                    const __m512 v = _mm512_sub_ps(_mm512_loadu_ps(d + i), mean_v);
+                    acc = _mm512_fmadd_ps(v, v, acc);
+                }
+                float tmp[16];
+                _mm512_storeu_ps(tmp, acc);
+                double scalar = 0.0;
+                for (int k = 0; k < 16; ++k) scalar += static_cast<double>(tmp[k]);
+                for (; i < n; ++i) { const double vv = static_cast<double>(d[i]) - m; scalar += vv * vv; }
+                return scalar / static_cast<double>(n);
+            }
+        }
+#endif
+        double acc = 0.0;
+        for (std::size_t i = 0; i < n; ++i) { const double v = static_cast<double>(d[i]) - m; acc += v * v; }
+        return acc / static_cast<double>(n);
+    }
+    double acc = 0.0;
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        const double v = static_cast<double>(a.data()[detail::offset_for_index(index, a.strides())]) - m;
+        acc += v * v;
+    }
+    return acc / static_cast<double>(a.size());
+}
+template <typename T> double var(const Array<T>& a) { return var<T>(a.view()); }
+
+template <typename T>
+double std(ArrayView<const T> a) {
+    return std::sqrt(var<T>(a));
+}
+template <typename T> double std(const Array<T>& a) { return std<T>(a.view()); }
+
+template <typename T>
+T ptp(ArrayView<const T> a) {
+    return max<T>(a) - min<T>(a);
+}
+template <typename T> T ptp(const Array<T>& a) { return ptp<T>(a.view()); }
+
+template <typename T>
+bool any(ArrayView<const T> a) {
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        if (a.data()[detail::offset_for_index(index, a.strides())] != T{}) return true;
+    }
+    return false;
+}
+template <typename T> bool any(const Array<T>& a) { return any<T>(a.view()); }
+
+template <typename T>
+bool all(ArrayView<const T> a) {
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        if (a.data()[detail::offset_for_index(index, a.strides())] == T{}) return false;
+    }
+    return true;
+}
+template <typename T> bool all(const Array<T>& a) { return all<T>(a.view()); }
+
+template <typename T>
+std::size_t count_nonzero(ArrayView<const T> a) {
+    if (a.is_contiguous()) {
+        const T* d = a.data();
+        const std::size_t n = a.size();
+#if defined(__AVX512F__)
+        if constexpr (std::is_same<T, float>::value) {
+            const __m512 zero = _mm512_setzero_ps();
+            std::size_t cnt = 0;
+            std::size_t i = 0;
+            const std::size_t vec_end = n - n % 16;
+            for (; i < vec_end; i += 16) {
+                __mmask16 m = _mm512_cmp_ps_mask(_mm512_loadu_ps(d + i), zero, _CMP_NEQ_OQ);
+                cnt += static_cast<std::size_t>(__builtin_popcount((unsigned)m));
+            }
+            for (; i < n; ++i) if (d[i] != T{}) ++cnt;
+            return cnt;
+        }
+#endif
+        std::size_t cnt = 0;
+        for (std::size_t i = 0; i < n; ++i) if (d[i] != T{}) ++cnt;
+        return cnt;
+    }
+    std::size_t cnt = 0;
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        if (a.data()[detail::offset_for_index(index, a.strides())] != T{}) ++cnt;
+    }
+    return cnt;
+}
+template <typename T> std::size_t count_nonzero(const Array<T>& a) { return count_nonzero<T>(a.view()); }
+
+template <typename T>
+Array<std::size_t> nonzero(ArrayView<const T> a) {
+    std::vector<std::size_t> idx;
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        if (a.data()[detail::offset_for_index(index, a.strides())] != T{}) idx.push_back(i);
+    }
+    Array<std::size_t> out = detail::make_uninitialized_array<std::size_t>({idx.size()});
+    for (std::size_t i = 0; i < idx.size(); ++i) out[i] = idx[i];
+    return out;
+}
+template <typename T> Array<std::size_t> nonzero(const Array<T>& a) { return nonzero<T>(a.view()); }
+
+template <typename T>
+T nansum(ArrayView<const T> a) {
+    T total = T{};
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        const T v = a.data()[detail::offset_for_index(index, a.strides())];
+        if (v == v) total += v;
+    }
+    return total;
+}
+template <typename T> T nansum(const Array<T>& a) { return nansum<T>(a.view()); }
+
+template <typename T>
+T nanmax(ArrayView<const T> a) {
+    T best = std::numeric_limits<T>::lowest();
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        const T v = a.data()[detail::offset_for_index(index, a.strides())];
+        if (v == v) best = std::max(best, v);
+    }
+    return best;
+}
+template <typename T> T nanmax(const Array<T>& a) { return nanmax<T>(a.view()); }
+
+template <typename T>
+T nanmin(ArrayView<const T> a) {
+    T best = std::numeric_limits<T>::max();
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        const T v = a.data()[detail::offset_for_index(index, a.strides())];
+        if (v == v) best = std::min(best, v);
+    }
+    return best;
+}
+template <typename T> T nanmin(const Array<T>& a) { return nanmin<T>(a.view()); }
+
+template <typename T>
 Array<std::size_t> argmin(ArrayView<const T> a, std::size_t axis) {
     detail::require(axis < a.ndim(), "axis out of range");
     detail::require(a.shape()[axis] > 0, "argmin of empty axis");
@@ -6705,6 +7275,221 @@ Array<T> cumsum(ArrayView<const T> a, std::size_t axis) {
 template <typename T>
 Array<T> cumsum(const Array<T>& a, std::size_t axis) {
     return cumsum<T>(a.view(), axis);
+}
+
+template <typename T>
+Array<T> sort(ArrayView<const T> a) {
+    Array<T> out = detail::make_uninitialized_array<T>(a.shape());
+    if (a.is_contiguous()) {
+        std::copy(a.data(), a.data() + a.size(), out.data());
+        std::sort(out.data(), out.data() + out.size());
+    } else {
+        Shape index;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            detail::linear_to_index(i, a.shape(), index);
+            out[i] = a.data()[detail::offset_for_index(index, a.strides())];
+        }
+        std::sort(out.data(), out.data() + out.size());
+    }
+    return out;
+}
+template <typename T> Array<T> sort(const Array<T>& a) { return sort<T>(a.view()); }
+
+template <typename T>
+Array<std::size_t> argsort(ArrayView<const T> a) {
+    std::vector<std::pair<T, std::size_t>> pairs;
+    pairs.reserve(a.size());
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        pairs.emplace_back(a.data()[detail::offset_for_index(index, a.strides())], i);
+    }
+    std::stable_sort(pairs.begin(), pairs.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    Array<std::size_t> out = detail::make_uninitialized_array<std::size_t>({pairs.size()});
+    for (std::size_t i = 0; i < pairs.size(); ++i) out[i] = pairs[i].second;
+    return out;
+}
+template <typename T> Array<std::size_t> argsort(const Array<T>& a) { return argsort<T>(a.view()); }
+
+template <typename T>
+Array<T> unique(ArrayView<const T> a) {
+    std::vector<T> vals;
+    vals.reserve(a.size());
+    Shape index;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        detail::linear_to_index(i, a.shape(), index);
+        vals.push_back(a.data()[detail::offset_for_index(index, a.strides())]);
+    }
+    std::sort(vals.begin(), vals.end());
+    vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+    Array<T> out = detail::make_uninitialized_array<T>({vals.size()});
+    for (std::size_t i = 0; i < vals.size(); ++i) out[i] = vals[i];
+    return out;
+}
+template <typename T> Array<T> unique(const Array<T>& a) { return unique<T>(a.view()); }
+
+template <typename T>
+Array<T> take(ArrayView<const T> a, ArrayView<const std::size_t> indices) {
+    Array<T> out = detail::make_uninitialized_array<T>({indices.size()});
+    const std::size_t* idx = indices.data();
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        out[i] = a[idx[i]];
+    }
+    return out;
+}
+template <typename T> Array<T> take(const Array<T>& a, const Array<std::size_t>& indices) { return take<T>(a.view(), indices.view()); }
+
+template <typename T>
+std::size_t searchsorted(ArrayView<const T> a, T v) {
+    const T* d = a.data();
+    std::size_t lo = 0, hi = a.size();
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (d[mid] < v) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+template <typename T> std::size_t searchsorted(const Array<T>& a, T v) { return searchsorted<T>(a.view(), v); }
+
+template <typename T>
+T trace(ArrayView<const T> a) {
+    detail::require(a.ndim() == 2, "trace requires 2D array");
+    const std::size_t n = std::min(a.shape()[0], a.shape()[1]);
+    T acc = T{};
+    Shape idx(2);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx[0] = i; idx[1] = i;
+        acc += a.at(idx);
+    }
+    return acc;
+}
+template <typename T> T trace(const Array<T>& a) { return trace<T>(a.view()); }
+
+template <typename T>
+Array<T> diagonal(ArrayView<const T> a) {
+    detail::require(a.ndim() == 2, "diagonal requires 2D array");
+    const std::size_t n = std::min(a.shape()[0], a.shape()[1]);
+    Array<T> out = detail::make_uninitialized_array<T>({n});
+    Shape idx(2);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx[0] = i; idx[1] = i;
+        out[i] = a.at(idx);
+    }
+    return out;
+}
+template <typename T> Array<T> diagonal(const Array<T>& a) { return diagonal<T>(a.view()); }
+
+template <typename T>
+Array<T> flip(ArrayView<const T> a) {
+    Array<T> out = detail::make_uninitialized_array<T>(a.shape());
+    const std::size_t n = a.size();
+    const T* d = a.data();
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = d[n - 1 - i];
+    }
+    return out;
+}
+template <typename T> Array<T> flip(const Array<T>& a) { return flip<T>(a.view()); }
+
+template <typename T>
+Array<T> tile(ArrayView<const T> a, const Shape& reps) {
+    Shape a_shape = a.shape();
+    Shape effective_reps = reps;
+    if (effective_reps.size() < a_shape.size()) {
+        effective_reps.insert(effective_reps.begin(), a_shape.size() - effective_reps.size(), 1);
+    }
+    if (a_shape.size() < effective_reps.size()) {
+        a_shape.insert(a_shape.begin(), effective_reps.size() - a_shape.size(), 1);
+    }
+    detail::require(a_shape.size() == effective_reps.size(), "tile reps mismatch");
+    Shape out_shape(a_shape.size());
+    for (std::size_t d = 0; d < a_shape.size(); ++d) out_shape[d] = a_shape[d] * effective_reps[d];
+    Array<T> out = detail::make_uninitialized_array<T>(out_shape);
+    Shape in_index(a_shape.size(), 0);
+    Shape out_index(a_shape.size(), 0);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        detail::linear_to_index(i, out_shape, out_index);
+        for (std::size_t d = 0; d < a_shape.size(); ++d) {
+            in_index[d] = out_index[d] % a_shape[d];
+        }
+        out[i] = a.data()[detail::offset_for_index(in_index, a.strides())];
+    }
+    return out;
+}
+template <typename T> Array<T> tile(const Array<T>& a, const Shape& reps) { return tile<T>(a.view(), reps); }
+
+template <typename T>
+Array<T> repeat(ArrayView<const T> a, std::size_t repeats) {
+    Array<T> out = detail::make_uninitialized_array<T>({a.size() * repeats});
+    const T* d = a.data();
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const T v = d[i];
+        for (std::size_t r = 0; r < repeats; ++r) out[i * repeats + r] = v;
+    }
+    return out;
+}
+template <typename T> Array<T> repeat(const Array<T>& a, std::size_t repeats) { return repeat<T>(a.view(), repeats); }
+
+template <typename T>
+Array<T> broadcast_to(ArrayView<const T> a, const Shape& shape) {
+    Array<T> out = detail::make_uninitialized_array<T>(shape);
+    const T* d = a.data();
+    const std::size_t lead = a.size();
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = d[i % lead];
+    }
+    return out;
+}
+template <typename T> Array<T> broadcast_to(const Array<T>& a, const Shape& shape) { return broadcast_to<T>(a.view(), shape); }
+
+template <typename T>
+Array<T> expand_dims(ArrayView<const T> a, std::size_t axis) {
+    Shape new_shape = a.shape();
+    new_shape.insert(new_shape.begin() + static_cast<std::ptrdiff_t>(axis), 1);
+    return as_contiguous(a.reshape(new_shape));
+}
+template <typename T> Array<T> expand_dims(const Array<T>& a, std::size_t axis) { return expand_dims<T>(a.view(), axis); }
+
+template <typename T>
+Array<T> vstack(const std::vector<ArrayView<const T>>& arrays) {
+    detail::require(!arrays.empty(), "vstack needs at least one array");
+    std::size_t cols = arrays[0].shape().size() == 1 ? arrays[0].size() : arrays[0].shape().back();
+    std::size_t rows = 0;
+    for (const auto& ar : arrays) {
+        rows += ar.shape().size() == 1 ? 1 : ar.shape()[0];
+    }
+    Array<T> out = detail::make_uninitialized_array<T>({rows, cols});
+    std::size_t r = 0;
+    for (const auto& ar : arrays) {
+        if (ar.shape().size() == 1) {
+            for (std::size_t c = 0; c < cols; ++c) out[Shape{r, c}] = ar.at(Shape{c});
+            ++r;
+        } else {
+            for (std::size_t rr = 0; rr < ar.shape()[0]; ++rr) {
+                for (std::size_t c = 0; c < cols; ++c) out[Shape{r, c}] = ar.at(Shape{rr, c});
+                ++r;
+            }
+        }
+    }
+    return out;
+}
+template <typename T>
+Array<T> hstack(const std::vector<ArrayView<const T>>& arrays) {
+    detail::require(!arrays.empty(), "hstack needs at least one array");
+    std::size_t total = 0;
+    for (const auto& ar : arrays) total += ar.size();
+    Array<T> out = detail::make_uninitialized_array<T>({total});
+    std::size_t off = 0;
+    Shape idx(1);
+    for (const auto& ar : arrays) {
+        for (std::size_t i = 0; i < ar.size(); ++i) {
+            idx[0] = i;
+            out[off + i] = ar.at(idx);
+        }
+        off += ar.size();
+    }
+    return out;
 }
 
 template <typename T>
