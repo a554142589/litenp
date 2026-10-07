@@ -5,20 +5,32 @@ on:
   pull_request:
 
 jobs:
+  # ---- L1/L2: build + C++ unit tests across OS / compiler / build type ----
   build-test:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        compiler: [g++, clang++]
-        build_type: [Release, Debug]
+        include:
+          - { os: ubuntu-22.04,  cxx: g++,      compiler_pkg: g++-11,           build_type: Release }
+          - { os: ubuntu-22.04,  cxx: g++,      compiler_pkg: g++-11,           build_type: Debug   }
+          - { os: ubuntu-22.04,  cxx: clang++,  compiler_pkg: clang-14,         build_type: Release }
+          - { os: ubuntu-22.04,  cxx: clang++,  compiler_pkg: clang-14,         build_type: Debug   }
+          - { os: macos-13,      cxx: clang++,  compiler_pkg: "",               build_type: Release }
+          - { os: macos-13,      cxx: clang++,  compiler_pkg: "",               build_type: Debug   }
+          - { os: windows-2022,  cxx: cl,       compiler_pkg: "",               build_type: Release }
+          - { os: windows-2022,  cxx: cl,       compiler_pkg: "",               build_type: Debug   }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install compiler (Ubuntu)
+        if: runner.os == 'Linux' && matrix.compiler_pkg != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.compiler_pkg }}
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
         env:
-          CXX: ${{ matrix.compiler }}
+          CXX: ${{ matrix.cxx }}
 
       - name: Build
         run: cmake --build build -j2
@@ -26,10 +38,14 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # ---- memory safety: ASan + UBSan ----
   sanitizer:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang-14
 
       - name: Configure ASan UBSan
         run: cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug
@@ -47,21 +63,65 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:verify_asan_link_order=0
           UBSAN_OPTIONS: print_stacktrace=1
 
+  # ---- L3: NumPy behavioral oracle ----
   numpy-oracle:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Install NumPy
         run: python3 -m pip install --upgrade pip numpy
 
-      - name: Run NumPy Oracle
+      - name: Run NumPy Oracle (g++)
         run: python3 tests/test_numpy_oracle.py
         env:
           CXX: g++
 
+  # ---- L3: libtorch behavioral oracle ----
+  libtorch-oracle:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PyTorch (CPU)
+        run: python3 -m pip install --upgrade pip torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run libtorch Oracle (g++)
+        run: python3 tests/test_libtorch_oracle.py
+        env:
+          CXX: g++
+
+  # ---- optional acceleration builds (OpenMP / CBLAS / native arch) ----
+  accel-build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        flags:
+          - "-DLITENP_USE_OPENMP=ON"
+          - "-DLITENP_USE_CBLAS=ON"
+          - "-DLITENP_NATIVE_ARCH=ON"
+          - "-DLITENP_USE_OPENMP=ON -DLITENP_USE_CBLAS=ON -DLITENP_NATIVE_ARCH=ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
+        env:
+          CXX: g++
+
+      - name: Build
+        run: cmake --build build -j2
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ---- benchmark smoke (benchmark target compiles) ----
   benchmark-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -71,8 +131,9 @@ jobs:
       - name: Build Benchmark Target
         run: cmake --build build-bench --target litenp_bench -j2
 
+  # ---- install + consume ----
   install-consume:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 

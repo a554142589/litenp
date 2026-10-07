@@ -76,6 +76,15 @@ if(LITENP_BUILD_BENCHMARKS)
     add_executable(litenp_bench benchmarks/bench_litenp.cpp)
     target_link_libraries(litenp_bench PRIVATE litenp::litenp)
 
+    find_package(Torch QUIET)
+    if(Torch_FOUND)
+        # Modern libtorch (2.x) requires C++20; litenp headers are C++17 and
+        # compile cleanly under C++20, so bump only the benchmark target.
+        target_compile_features(litenp_bench PRIVATE cxx_std_20)
+        target_link_libraries(litenp_bench PRIVATE "${TORCH_LIBRARIES}")
+        target_compile_definitions(litenp_bench PRIVATE LITENP_HAS_TORCH=1)
+    endif()
+
     find_path(
         EIGEN3_INCLUDE_DIR
         Eigen/Core
@@ -87,12 +96,6 @@ if(LITENP_BUILD_BENCHMARKS)
     if(EIGEN3_INCLUDE_DIR)
         target_include_directories(litenp_bench PRIVATE "${EIGEN3_INCLUDE_DIR}")
         target_compile_definitions(litenp_bench PRIVATE LITENP_HAS_EIGEN=1)
-    endif()
-
-    find_package(Torch QUIET)
-    if(Torch_FOUND)
-        target_link_libraries(litenp_bench PRIVATE "${TORCH_LIBRARIES}")
-        target_compile_definitions(litenp_bench PRIVATE LITENP_HAS_TORCH=1)
     endif()
 endif()
 
