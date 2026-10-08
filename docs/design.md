@@ -16,11 +16,16 @@ The MVP contains:
 - Common construction helpers such as `zeros`, `ones`, `full`, `linspace`,
   and `eye`.
 - Shape utilities, contiguous strides, reshape, and slicing.
-- Step slicing and `select` views without copies.
+- Step slicing (positive and negative; `litenp::SLICE_OPEN` sentinel for
+  omitted `begin`/`end`, mirroring Python slice semantics) and `select`
+  views without copies.
 - Transpose and permutation views.
 - Shape helpers (`flatten`, `squeeze`, `unsqueeze`) and `astype`.
-- Elementwise arithmetic with broadcasting.
-- Mixed dtype arithmetic via `std::common_type_t` for template-level promotion.
+- Elementwise arithmetic with broadcasting via a unified `BroadcastPlan`
+  (output shape and per-operand strides precomputed once and reused by
+  binary ops, comparisons, and `where`).
+- Mixed dtype arithmetic via a NumPy-compatible `promote_type` (kind+bits
+  rule; e.g. `int32 + float -> double`), replacing `std::common_type_t`.
 - Common unary kernels for inference-style workloads.
 - Mask-style conditionals: comparisons, `where`, and `clip`.
 - Array combination with `concatenate` and `stack`.
