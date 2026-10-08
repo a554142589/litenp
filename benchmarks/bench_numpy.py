@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import platform
@@ -56,6 +57,11 @@ def size_label(n: int) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="NumPy benchmark baseline for litenp.")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Write JSON output to this file (default: stdout).")
+    args = parser.parse_args()
+
     rows: List[Row] = []
     n4m = 1 << 22
 
@@ -150,7 +156,7 @@ def main() -> None:
         mout = np.empty((side, side), dtype=np.float32)
         add_row(rows, f"matmul uniform {side}", lambda a=ma, b=mb, out=mout: np.matmul(a, b, out=out), repeats=repeats)
 
-    print(json.dumps({
+    payload = json.dumps({
         "metadata": {
             "benchmark": "numpy",
             "numpy_version": np.__version__,
@@ -164,7 +170,13 @@ def main() -> None:
             }
         },
         "rows": rows
-    }, indent=2, sort_keys=True))
+    }, indent=2, sort_keys=True)
+
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(payload)
+    else:
+        print(payload)
 
 
 if __name__ == "__main__":
