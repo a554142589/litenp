@@ -22,6 +22,45 @@ namespace {
 
 volatile double g_sink = 0.0;
 
+// Deterministic LCG feeding the dense-random benchmark group. NumPy-grade
+// randomness is unnecessary here: the point is just non-uniform data that
+// defeats litenp's uniform-value fast paths, so a simple LCG keeps the run
+// reproducible across machines without dragging in <random> or seeding
+// surprises. The constants are the PCG/Marsaglia-style 64-bit multiplier.
+struct Lcg {
+    std::uint64_t state;
+    explicit Lcg(std::uint64_t seed) : state(seed ? seed : 0x9e3779b97f4a7c15ull) {}
+    std::uint32_t next() {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<std::uint32_t>(state >> 32);
+    }
+    float next_float() {  // uniform in [0, 1)
+        return (next() >> 8) * (1.0f / static_cast<float>(1u << 24));
+    }
+    float in_range(float lo, float hi) {
+        return lo + (hi - lo) * next_float();
+    }
+};
+
+// Fill an Array<T> with deterministic non-uniform float values in (lo, hi),
+// cast to T. Used by the dense-random group so binary/reduce/matmul kernels
+// cannot take the uniform-value shortcut.
+template <typename T>
+void fill_random(litenp::Array<T>& a, Lcg& rng, float lo = -2.0f, float hi = 2.0f) {
+    T* p = a.data();
+    const std::size_t n = a.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        p[i] = static_cast<T>(rng.in_range(lo, hi));
+    }
+}
+
+template <typename T>
+litenp::Array<T> make_random(const std::vector<std::size_t>& shape, Lcg& rng, float lo = -2.0f, float hi = 2.0f) {
+    litenp::Array<T> a(shape);
+    fill_random(a, rng, lo, hi);
+    return a;
+}
+
 struct TimingStats {
     double best = -1.0;
     double median = -1.0;
@@ -1076,22 +1115,116 @@ void bench_scale_matrix() {
     bench_closeout_diagnostics();
 }
 
+// dense-random group: non-uniform data that defeats litenp's uniform-value
+// fast paths, exercising the materialized dense kernels the way real
+// workloads hit them. Includes noncontiguous (strided) inputs and a
+// multi-size random matmul sweep. This is the group to read when comparing
+// litenp dense kernels against NumPy/Eigen/libtorch on ordinary data.
+void bench_dense_random() {
+    print_header("dense random");
+    Lcg rng(0x12345678ull);
+    constexpr std::size_t n = 1u << 22;
+    auto a = make_random<float>({n}, rng);
+    auto b = make_random<float>({n}, rng);
+    litenp::Array<float> out({n});
+
+    print_timed("add random 4M f32", [&] { litenp::add_into<float>(a.view(), b.view(), out.view()); }, [&] { return checksum_array(out); });
+    print_timed("subtract random 4M f32", [&] { litenp::subtract_into<float>(a.view(), b.view(), out.view()); }, [&] { return checksum_array(out); });
+    print_timed("multiply random 4M f32", [&] { litenp::multiply_into<float>(a.view(), b.view(), out.view()); }, [&] { return checksum_array(out); });
+    print_timed("divide random 4M f32", [&] { litenp::divide_into<float>(a.view(), b.view(), out.view()); }, [&] { return checksum_array(out); });
+
+    // noncontiguous inputs: strided views (step 2) defeat contiguous fast
+    // paths and force the generic strided kernel.
+    auto a_nc = a.view().slice(0, litenp::SLICE_OPEN, litenp::SLICE_OPEN, 2);
+    auto b_nc = b.view().slice(0, litenp::SLICE_OPEN, litenp::SLICE_OPEN, 2);
+    litenp::Array<float> out_nc(a_nc.shape());
+    print_timed("add noncontig 2M f32", [&] { litenp::add_into<float>(a_nc, b_nc, out_nc.view()); }, [&] { return checksum_array(out_nc); });
+    print_timed("multiply noncontig 2M f32", [&] { litenp::multiply_into<float>(a_nc, b_nc, out_nc.view()); }, [&] { return checksum_array(out_nc); });
+
+    // random reductions over a 2048x2048 matrix (non-uniform data, no shortcut)
+    auto mat = make_random<float>({2048, 2048}, rng);
+    float sf = 0.0f;
+    double md = 0.0;
+    litenp::Array<float> out_f;
+    print_timed("sum random all 2048x2048", [&] { sf = litenp::sum(mat); }, [&] { return sf; });
+    print_timed("mean random all 2048x2048", [&] { md = litenp::mean(mat); }, [&] { return md; });
+    print_timed("max random all 2048x2048", [&] { sf = litenp::max(mat); }, [&] { return sf; });
+    print_timed("sum random axis0 2048x2048", [&] { out_f = litenp::sum(mat, 0); }, [&] { return checksum_array(out_f); });
+    print_timed("sum random axis1 2048x2048", [&] { out_f = litenp::sum(mat, 1); }, [&] { return checksum_array(out_f); });
+
+    // random matmul sweep across sizes (non-uniform operands, no GEMM shortcut)
+    for (std::size_t side : {128u, 256u, 512u, 1024u}) {
+        auto ma = make_random<float>({side, side}, rng);
+        auto mb = make_random<float>({side, side}, rng);
+        litenp::Array<float> mc({side, side});
+        const int reps = side >= 512 ? 3 : 5;
+        print_timed("matmul random " + std::to_string(side),
+                    [&] { litenp::matmul_into<float>(ma.view(), mb.view(), mc.view()); },
+                    [&] { return checksum_array(mc); }, reps);
+    }
+
+#if defined(LITENP_HAS_EIGEN)
+    {
+        Eigen::MatrixXf ea = Eigen::MatrixXf::Constant(384, 384, 0.0);
+        for (Eigen::Index i = 0; i < ea.size(); ++i) ea(i) = rng.in_range(-2.0f, 2.0f);
+        Eigen::MatrixXf eb = Eigen::MatrixXf::Constant(384, 384, 0.0);
+        for (Eigen::Index i = 0; i < eb.size(); ++i) eb(i) = rng.in_range(-2.0f, 2.0f);
+        Eigen::MatrixXf ec(384, 384);
+        print_timed("Eigen matmul random 384", [&] { ec.noalias() = ea * eb; }, [&] { return ec(0, 0) + ec(383, 383); }, 3);
+    }
+#endif
+
+#if defined(LITENP_HAS_TORCH)
+    {
+        auto ta = torch::empty({384, 384}, torch::kFloat32);
+        auto tb = torch::empty({384, 384}, torch::kFloat32);
+        auto acc_a = ta.accessor<float, 2>();
+        auto acc_b = tb.accessor<float, 2>();
+        for (int i = 0; i < 384; ++i)
+            for (int j = 0; j < 384; ++j) {
+                acc_a[i][j] = rng.in_range(-2.0f, 2.0f);
+                acc_b[i][j] = rng.in_range(-2.0f, 2.0f);
+            }
+        torch::Tensor tc;
+        print_timed("libtorch matmul random 384", [&] { tc = torch::matmul(ta, tb); }, [&] { return tc[0][0].item<float>() + tc[-1][-1].item<float>(); }, 3);
+    }
+#endif
+}
+
 }  // namespace
 
 int main() {
     std::cout << "litenp comprehensive benchmark (best-of timing)\n";
+
+    // Group 1 — structured: uniform / metadata inputs exercising litenp's
+    // structure-aware fast paths (uniform-value shortcuts, virtual metadata,
+    // transpose/reshape without materialization). High speedups here mean
+    // litenp avoided work, not a faster dense kernel.
+    std::cout << "\n=== group: structured ===\n";
     bench_construction();
     bench_metadata_accessors();
     bench_views();
     bench_view_compare_matrix();
     bench_copy_cast();
     bench_binary();
-    bench_unary();
-    bench_condition();
     bench_reduce();
     bench_combine();
     bench_matmul();
     bench_scale_matrix();
+
+    // Group 2 — dense-patterned: materialized kernels over patterned (non-
+    // uniform but deterministic) data such as (idx % N). Defeats the
+    // uniform-value shortcut while staying reproducible across runs.
+    std::cout << "\n=== group: dense-patterned ===\n";
+    bench_unary();
+    bench_condition();
+
+    // Group 3 — dense-random: materialized kernels over non-uniform random
+    // data, plus noncontiguous (strided) inputs and a multi-size random
+    // matmul sweep. The closest group to ordinary dense workloads.
+    std::cout << "\n=== group: dense-random ===\n";
+    bench_dense_random();
+
     std::cout << "\nsink: " << g_sink << "\n";
     return 0;
 }

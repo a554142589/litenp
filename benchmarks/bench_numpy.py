@@ -156,6 +156,40 @@ def main() -> None:
         mout = np.empty((side, side), dtype=np.float32)
         add_row(rows, f"matmul uniform {side}", lambda a=ma, b=mb, out=mout: np.matmul(a, b, out=out), repeats=repeats)
 
+    # ---- dense-random group: non-uniform data defeating structure-aware
+    # fast paths, plus noncontiguous (strided) inputs and a multi-size
+    # random matmul sweep. Mirrors the `dense random` section of
+    # bench_litenp.cpp row-for-row so C++/NumPy timings align by name.
+    rng = np.random.RandomState(0x12345678)
+    r4m = rng.uniform(-2.0, 2.0, n4m).astype(np.float32)
+    r4m_b = rng.uniform(-2.0, 2.0, n4m).astype(np.float32)
+    rout = np.empty_like(r4m)
+    add_row(rows, "add random 4M f32", lambda: np.add(r4m, r4m_b, out=rout))
+    add_row(rows, "subtract random 4M f32", lambda: np.subtract(r4m, r4m_b, out=rout))
+    add_row(rows, "multiply random 4M f32", lambda: np.multiply(r4m, r4m_b, out=rout))
+    add_row(rows, "divide random 4M f32", lambda: np.divide(r4m, r4m_b, out=rout))
+
+    # noncontiguous strided views (step 2), 2M elements each
+    r_nc = r4m[::2]
+    r_nc_b = r4m_b[::2]
+    out_nc = np.empty_like(r_nc)
+    add_row(rows, "add noncontig 2M f32", lambda: np.add(r_nc, r_nc_b, out=out_nc))
+    add_row(rows, "multiply noncontig 2M f32", lambda: np.multiply(r_nc, r_nc_b, out=out_nc))
+
+    rmat = rng.uniform(-2.0, 2.0, (2048, 2048)).astype(np.float32)
+    add_row(rows, "sum random all 2048x2048", lambda: rmat.sum())
+    add_row(rows, "mean random all 2048x2048", lambda: rmat.mean())
+    add_row(rows, "max random all 2048x2048", lambda: rmat.max())
+    add_row(rows, "sum random axis0 2048x2048", lambda: rmat.sum(axis=0))
+    add_row(rows, "sum random axis1 2048x2048", lambda: rmat.sum(axis=1))
+
+    for side in (128, 256, 512, 1024):
+        repeats = 3 if side >= 512 else 5
+        rma = rng.uniform(-2.0, 2.0, (side, side)).astype(np.float32)
+        rmb = rng.uniform(-2.0, 2.0, (side, side)).astype(np.float32)
+        rmout = np.empty((side, side), dtype=np.float32)
+        add_row(rows, f"matmul random {side}", lambda a=rma, b=rmb, out=rmout: np.matmul(a, b, out=out), repeats=repeats)
+
     payload = json.dumps({
         "metadata": {
             "benchmark": "numpy",

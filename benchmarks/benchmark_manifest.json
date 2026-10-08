@@ -80,6 +80,22 @@
     {"name": "matmul uniform 384", "operator": "matmul", "cpp": "matmul uniform 384", "numpy": "matmul uniform 384", "required": true, "baselines": {"numpy": true, "eigen": true, "torch": true}},
     {"name": "matmul uniform 512", "operator": "matmul", "cpp": "matmul uniform 512", "numpy": "matmul uniform 512", "required": true, "baselines": {"numpy": true, "eigen": true, "torch": true}},
     {"name": "matmul uniform 768", "operator": "matmul", "cpp": "matmul uniform 768", "numpy": "matmul uniform 768", "required": true, "baselines": {"numpy": true, "eigen": true, "torch": true}},
-    {"name": "matmul uniform 1024", "operator": "matmul", "cpp": "matmul uniform 1024", "numpy": "matmul uniform 1024", "required": true, "baselines": {"numpy": true, "eigen": true, "torch": true}}
+    {"name": "matmul uniform 1024", "operator": "matmul", "cpp": "matmul uniform 1024", "numpy": "matmul uniform 1024", "required": true, "baselines": {"numpy": true, "eigen": true, "torch": true}},
+
+    {"name": "add random 4M f32", "operator": "add_into", "cpp": "add random 4M f32", "numpy": "add random 4M f32", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "subtract random 4M f32", "operator": "subtract_into", "cpp": "subtract random 4M f32", "numpy": "subtract random 4M f32", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "multiply random 4M f32", "operator": "multiply_into", "cpp": "multiply random 4M f32", "numpy": "multiply random 4M f32", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "divide random 4M f32", "operator": "divide_into", "cpp": "divide random 4M f32", "numpy": "divide random 4M f32", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "add noncontig 2M f32", "operator": "add_into", "cpp": "add noncontig 2M f32", "numpy": "add noncontig 2M f32", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "multiply noncontig 2M f32", "operator": "multiply_into", "cpp": "multiply noncontig 2M f32", "numpy": "multiply noncontig 2M f32", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "sum random all 2048x2048", "operator": "sum", "cpp": "sum random all 2048x2048", "numpy": "sum random all 2048x2048", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "mean random all 2048x2048", "operator": "mean", "cpp": "mean random all 2048x2048", "numpy": "mean random all 2048x2048", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "max random all 2048x2048", "operator": "max", "cpp": "max random all 2048x2048", "numpy": "max random all 2048x2048", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "sum random axis0 2048x2048", "operator": "sum_axis0", "cpp": "sum random axis0 2048x2048", "numpy": "sum random axis0 2048x2048", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "sum random axis1 2048x2048", "operator": "sum_axis1", "cpp": "sum random axis1 2048x2048", "numpy": "sum random axis1 2048x2048", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "matmul random 128", "operator": "matmul", "cpp": "matmul random 128", "numpy": "matmul random 128", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "matmul random 256", "operator": "matmul", "cpp": "matmul random 256", "numpy": "matmul random 256", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "matmul random 512", "operator": "matmul", "cpp": "matmul random 512", "numpy": "matmul random 512", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}},
+    {"name": "matmul random 1024", "operator": "matmul", "cpp": "matmul random 1024", "numpy": "matmul random 1024", "required": false, "baselines": {"numpy": true, "eigen": false, "torch": false}}
   ]
 }

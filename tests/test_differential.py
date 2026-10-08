@@ -32,12 +32,27 @@ CASES = int(os.environ.get("CASES", "64"))
 # ---------------------------------------------------------------------------
 # dtype bridge: numpy <-> C++ <-> oracle tag
 # ---------------------------------------------------------------------------
-# tag: short name used in result identifiers
+# tag: short name used in result identifiers. 10-tag grid covers the full
+# NumPy dtype promotion matrix (u8/i8/u16/i16/u32/i32/u64/i64/f32/f64).
 DTYPE_INFO = {
-    "f32": (np.float32, "float", "std::int32_t"),  # (np_dtype, cpp_name, _)
-    "f64": (np.float64, "double", "std::int32_t"),
-    "i32": (np.int32, "std::int32_t", "std::int32_t"),
+    "u8":  (np.uint8,   "std::uint8_t",   "std::uint8_t"),
+    "i8":  (np.int8,    "std::int8_t",    "std::int8_t"),
+    "u16": (np.uint16,  "std::uint16_t",  "std::uint16_t"),
+    "i16": (np.int16,   "std::int16_t",  "std::int16_t"),
+    "u32": (np.uint32,  "std::uint32_t", "std::uint32_t"),
+    "i32": (np.int32,   "std::int32_t",  "std::int32_t"),
+    "u64": (np.uint64,  "std::uint64_t", "std::uint64_t"),
+    "i64": (np.int64,   "std::int64_t",  "std::int64_t"),
+    "f32": (np.float32, "float",         "std::int32_t"),
+    "f64": (np.float64, "double",        "std::int32_t"),
 }
+
+# all 10 dtype tags, used by case generators for wider fuzz coverage
+ALL_DTYPE_TAGS = list(DTYPE_INFO.keys())
+# integer-only tags, used by integer-aware cases (cumsum / astype targets)
+INT_DTYPE_TAGS = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"]
+# float-only tags, used by NaN/Inf-capable cases
+FLOAT_DTYPE_TAGS = ["f32", "f64"]
 
 
 def np_dtype(tag: str) -> np.dtype:
@@ -49,7 +64,39 @@ def cpp_name(tag: str) -> str:
 
 
 def is_float(tag: str) -> bool:
-    return tag in ("f32", "f64")
+    return tag in FLOAT_DTYPE_TAGS
+
+
+def is_unsigned_int(tag: str) -> bool:
+    return tag in ("u8", "u16", "u32", "u64")
+
+
+def is_signed_int(tag: str) -> bool:
+    return tag in ("i8", "i16", "i32", "i64")
+
+
+def is_int(tag: str) -> bool:
+    return is_unsigned_int(tag) or is_signed_int(tag)
+
+
+def dtype_bits(tag: str) -> int:
+    return {"u8": 8, "i8": 8, "u16": 16, "i16": 16, "u32": 32, "i32": 32,
+            "u64": 64, "i64": 64, "f32": 32, "f64": 64}[tag]
+
+
+def int_range_for(tag: str) -> int:
+    """Safe positive magnitude bound for random integer values so that
+    intermediate results (e.g. a*b during multiply fuzz) stay representable
+    in the next-larger integer type and don't surprise the oracle."""
+    if tag == "u8":  return 6
+    if tag == "i8":  return 5
+    if tag == "u16": return 40
+    if tag == "i16": return 30
+    if tag == "u32": return 1000
+    if tag == "i32": return 1000
+    if tag == "u64": return 1000
+    if tag == "i64": return 1000
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +105,11 @@ def is_float(tag: str) -> bool:
 
 def fmt_value(v, tag: str) -> str:
     """Format a single numeric value as a C++ literal of the right dtype."""
-    if tag == "i32":
+    if is_int(tag):
+        # numpy integers may be int64 / uint64; cast carefully to fit C++ type.
+        # Negative values on unsigned dtypes are clipped to 0 to keep behavior
+        # explicit; the oracle (np.uint8(-1)) would wrap, but we avoid that by
+        # construction in rand_array.
         return f"{int(v)}"
     # float types: handle NaN/Inf explicitly
     fv = float(v)
@@ -112,14 +163,28 @@ def rand_shape(rng: random.Random, ndim: int | None = None,
 
 
 def rand_array(rng: random.Random, tag: str, shape: tuple[int, ...],
-              nan_prob: float = 0.0, int_range: int = 6):
-    """Generate a random NumPy array of given dtype/shape; optionally inject NaN."""
+              nan_prob: float = 0.0, int_range: int = 0,
+              inf_prob: float = 0.0):
+    """Generate a random NumPy array of given dtype/shape; optionally inject
+    NaN (floats only) and Inf (floats only).
+
+    For integer dtypes the value range is sized to the dtype so that multiply
+    fuzz (e.g. u8*u8) does not silently overflow into the wrapped regime — the
+    oracle NumPy would also wrap, but we keep operands small to make the
+    output stay in-range and the comparison unambiguous.
+    """
     n = 1
     for d in shape:
         n *= d
-    if tag == "i32":
-        data = [rng.randint(-int_range, int_range) for _ in range(n)]
-        return np.array(data, dtype=np.int32).reshape(shape)
+    if is_int(tag):
+        if int_range <= 0:
+            int_range = int_range_for(tag)
+        if is_unsigned_int(tag):
+            data = [rng.randint(0, int_range) for _ in range(n)]
+        else:
+            # small symmetric range so signed additions stay in range
+            data = [rng.randint(-int_range, int_range) for _ in range(n)]
+        return np.array(data, dtype=np_dtype(tag)).reshape(shape)
     # float: pick from a small set including 0, negatives, fractions
     pool = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 4.0, -3.0]
     data = [rng.choice(pool) for _ in range(n)]
@@ -127,6 +192,10 @@ def rand_array(rng: random.Random, tag: str, shape: tuple[int, ...],
         for i in range(n):
             if rng.random() < nan_prob:
                 data[i] = float("nan")
+    if inf_prob > 0.0:
+        for i in range(n):
+            if rng.random() < inf_prob:
+                data[i] = float("inf") if rng.random() < 0.5 else float("-inf")
     return np.array(data, dtype=np_dtype(tag)).reshape(shape)
 
 
@@ -135,12 +204,16 @@ def rand_array(rng: random.Random, tag: str, shape: tuple[int, ...],
 # ---------------------------------------------------------------------------
 
 def gen_unary_cases(rng: random.Random, n: int):
+    # sqrt/exp/sigmoid are float-only ops in litenp (they route through
+    # std::sqrt/exp of double then cast back); on integer inputs the numpy
+    # oracle returns float64, which would force a mixed-dtype comparison and
+    # obscure real unary-op bugs. So restrict unary fuzz to float dtypes.
     ops = ["negative", "abs", "relu", "sqrt", "exp", "sigmoid"]
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        tag = rng.choice(FLOAT_DTYPE_TAGS)
         shape = rand_shape(rng)
-        arr = rand_array(rng, tag, shape, nan_prob=0.05)
+        arr = rand_array(rng, tag, shape, nan_prob=0.05, inf_prob=0.02)
         op = rng.choice(ops)
         cases.append(("unary", tag, op, arr))
     return cases
@@ -150,16 +223,84 @@ def gen_binary_cases(rng: random.Random, n: int):
     ops = ["add", "subtract", "multiply", "divide", "minimum", "maximum"]
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        # all 10 dtypes; NumPy semantics for same-dtype binary is well defined
+        # for every integer pair too (with wraparound on overflow).
+        tag = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng)
-        a = rand_array(rng, tag, shape, nan_prob=0.05)
-        b = rand_array(rng, tag, shape, nan_prob=0.05)
-        # avoid div-by-zero issues in oracle: shift zeros to 1 for divide
-        if rng.random() < 0.3:
+        nan_p = 0.05 if is_float(tag) else 0.0
+        inf_p = 0.02 if is_float(tag) else 0.0
+        a = rand_array(rng, tag, shape, nan_prob=nan_p, inf_prob=inf_p)
+        b = rand_array(rng, tag, shape, nan_prob=nan_p, inf_prob=inf_p)
+        op = rng.choice(ops)
+        if op == "divide":
+            if is_int(tag):
+                # litenp::divide<int> is C++ integer division (truncation toward
+                # zero), which has no NumPy equivalent: np.divide is true
+                # division (returns float64), np.floor_divide floors toward
+                # -inf. Map integer divide onto floor_divide, whose semantics
+                # are well-defined on both sides (litenp floor_divide<int> =
+                # floor(double(a)/double(b)); for the small integers the
+                # fuzzer generates the double route is exact). Float divide
+                # stays as-is: litenp divide<float> == NumPy a/b.
+                op = "floor_divide"
+            # float divide: litenp divide<float> == NumPy a/b (true division),
+            # and litenp's float divide produces inf on a zero divisor rather
+            # than trapping, so no zero-guard is needed.
+        if op == "floor_divide" and is_int(tag):
+            # Integer floor_divide still traps (SIGFPE) on a zero divisor in
+            # the C++ path; force any zero divisor to 1.
             b = b.copy()
             b[b == 0] = 1
-        op = rng.choice(ops)
         cases.append(("binary", tag, op, a, b))
+    return cases
+
+
+def gen_mixed_binary_cases(rng: random.Random, n: int):
+    """dtype × dtype fuzz: pick two distinct dtype tags, run a binary op,
+    compare against NumPy after promotion. Exercises promote_type rules.
+
+    Note: only add/subtract/multiply/divide/true_divide have mixed-dtype
+    overloads in litenp; minimum/maximum are same-dtype only. We include
+    true_divide separately because its integer operands promote to double.
+    Same-dtype pairs are excluded because the mixed overload has a
+    `!std::is_same<A,B>` SFINAE guard; same-dtype fuzz is covered by the
+    plain `binary` generator."""
+    ops = ["add", "subtract", "multiply", "divide", "true_divide"]
+    cases = []
+    for i in range(n):
+        # bias toward pairs that exercise promotion edges: ~50% random pair,
+        # ~50% curated pairs from the int64/uint64/float64 frontier
+        if rng.random() < 0.5:
+            ta = rng.choice(ALL_DTYPE_TAGS)
+            tb = rng.choice([t for t in ALL_DTYPE_TAGS if t != ta])
+        else:
+            ta, tb = rng.choice([
+                ("i64", "u64"), ("u64", "i64"),
+                ("i32", "u32"), ("u32", "i32"),
+                ("f32", "i32"), ("i32", "f64"),
+                ("u8", "f32"),  ("i8", "u16"),
+                ("u64", "f32"), ("i64", "f64"),
+            ])
+        shape = rand_shape(rng)
+        nan_a = 0.05 if is_float(ta) else 0.0
+        nan_b = 0.05 if is_float(tb) else 0.0
+        a = rand_array(rng, ta, shape, nan_prob=nan_a)
+        b = rand_array(rng, tb, shape, nan_prob=nan_b)
+        op = rng.choice(ops)
+        if op == "divide":
+            # litenp mixed divide<A,B> on two integers promotes to an integer
+            # type (C++ trunc division), but NumPy a/b is true division and
+            # returns float64 — the two disagree on sign and remainder.
+            # Route integer/integer divide onto true_divide (litenp's mixed
+            # true_divide<A,B> promotes integers to double, matching NumPy).
+            # Float-involved divide keeps divide: the promoted type is float,
+            # and litenp divide<float> == NumPy a/b.
+            if is_int(ta) and is_int(tb):
+                op = "true_divide"
+        # `true_divide` promotes to double and never traps on zero divisor;
+        # no zero-guard needed for either divide (float, inf-producing) or
+        # true_divide.
+        cases.append(("mixed_binary", ta, tb, op, a, b))
     return cases
 
 
@@ -167,20 +308,25 @@ def gen_broadcast_cases(rng: random.Random, n: int):
     ops = ["add", "subtract", "multiply", "divide", "minimum", "maximum"]
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng, ndim=2)
-        a = rand_array(rng, tag, shape, nan_prob=0.05)
+        nan_p = 0.05 if is_float(tag) else 0.0
+        a = rand_array(rng, tag, shape, nan_prob=nan_p)
         # build a broadcastable b: same ndim, some axis = 1
         b_shape = list(shape)
         # set ~half the axes to size 1
         for j in range(len(b_shape)):
             if rng.random() < 0.4 and b_shape[j] != 0:
                 b_shape[j] = 1
-        b = rand_array(rng, tag, tuple(b_shape), nan_prob=0.05)
-        if rng.random() < 0.3:
+        b = rand_array(rng, tag, tuple(b_shape), nan_prob=nan_p)
+        op = rng.choice(ops)
+        if op == "divide" and is_int(tag):
+            # same rationale as gen_binary_cases: integer divide has no
+            # NumPy-equivalent trunc path, so route to floor_divide.
+            op = "floor_divide"
+        if op == "floor_divide" and is_int(tag):
             b = b.copy()
             b[b == 0] = 1
-        op = rng.choice(ops)
         cases.append(("broadcast", tag, op, a, b))
     return cases
 
@@ -189,10 +335,11 @@ def gen_comparison_cases(rng: random.Random, n: int):
     ops = ["greater", "less", "greater_equal", "less_equal", "equal", "not_equal"]
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng)
-        a = rand_array(rng, tag, shape, nan_prob=0.1)
-        b = rand_array(rng, tag, shape, nan_prob=0.1)
+        nan_p = 0.1 if is_float(tag) else 0.0
+        a = rand_array(rng, tag, shape, nan_prob=nan_p)
+        b = rand_array(rng, tag, shape, nan_prob=nan_p)
         op = rng.choice(ops)
         cases.append(("compare", tag, op, a, b))
     return cases
@@ -201,9 +348,10 @@ def gen_comparison_cases(rng: random.Random, n: int):
 def gen_reduction_cases(rng: random.Random, n: int):
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng, allow_empty=True)
-        arr = rand_array(rng, tag, shape, nan_prob=0.05)
+        nan_p = 0.05 if is_float(tag) else 0.0
+        arr = rand_array(rng, tag, shape, nan_prob=nan_p)
         op = rng.choice(["sum", "mean", "max", "min"])
         # axis: None (all-reduce) or an axis
         if len(shape) == 0 or rng.random() < 0.3:
@@ -217,9 +365,10 @@ def gen_reduction_cases(rng: random.Random, n: int):
 def gen_slice_cases(rng: random.Random, n: int):
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng, ndim=2, allow_empty=False)
-        arr = rand_array(rng, tag, shape, nan_prob=0.05)
+        nan_p = 0.05 if is_float(tag) else 0.0
+        arr = rand_array(rng, tag, shape, nan_prob=nan_p)
         axis = rng.randint(0, len(shape) - 1)
         dim = shape[axis]
         # pick step in [-3, -1] U [1, 3] (step 0 invalid)
@@ -247,12 +396,23 @@ def gen_slice_cases(rng: random.Random, n: int):
 
 
 def gen_astype_cases(rng: random.Random, n: int):
+    """astype fuzz over the full 10×10 dtype grid: source tag × target tag.
+    Each cell exercises a unique cast path (float→int truncation, int→float
+    rounding, signed↔unsigned wraparound).
+
+    Inf and NaN inputs are deliberately excluded for float sources: NumPy's
+    float→int cast for inf/NaN is implementation-defined in ways that depend
+    on the intermediate int64 representation (inf→0 for i8 but INT64_MIN for
+    i32 in NumPy 2.5), which litenp's saturating cast cannot replicate
+    exactly. Keep finite float values so the test exercises the cast logic
+    rather than undefined NumPy behavior."""
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64", "i32"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
+        target = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng)
-        arr = rand_array(rng, tag, shape, nan_prob=0.05 if is_float(tag) else 0.0)
-        target = rng.choice(["f32", "f64", "i32"])
+        arr = rand_array(rng, tag, shape,
+                         nan_prob=0.0, inf_prob=0.0)
         cases.append(("astype", tag, target, arr))
     return cases
 
@@ -262,7 +422,7 @@ def gen_broadcast_to_cases(rng: random.Random, n: int):
     by replacing some size-1 axes with larger dims."""
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
         ndim = rng.randint(1, 3)
         in_shape = list(rand_shape(rng, ndim=ndim, allow_empty=False))
         # zero out axes of size 1 (broadcast-friendly) but keep rank
@@ -271,7 +431,8 @@ def gen_broadcast_to_cases(rng: random.Random, n: int):
         for j in range(len(target)):
             if target[j] == 1 and rng.random() < 0.6:
                 target[j] = rng.randint(2, 6)
-        arr = rand_array(rng, tag, tuple(in_shape), nan_prob=0.05)
+        arr = rand_array(rng, tag, tuple(in_shape),
+                        nan_prob=0.05 if is_float(tag) else 0.0)
         cases.append(("broadcast_to", tag, arr, tuple(target)))
     return cases
 
@@ -279,11 +440,11 @@ def gen_broadcast_to_cases(rng: random.Random, n: int):
 def gen_cumsum_cases(rng: random.Random, n: int):
     cases = []
     for i in range(n):
-        tag = rng.choice(["f32", "f64", "i32"])
+        tag = rng.choice(ALL_DTYPE_TAGS)
         shape = rand_shape(rng, allow_empty=False, ndim=2)
         arr = rand_array(rng, tag, shape,
                          nan_prob=0.05 if is_float(tag) else 0.0,
-                         int_range=4)
+                         int_range=4 if is_int(tag) else 0)
         # litenp cumsum requires an explicit axis (no axis-less overload yet).
         axis = rng.randint(0, len(shape) - 1)
         cases.append(("cumsum", tag, arr, axis))
@@ -382,6 +543,25 @@ def binary_cpp(idx: int, case) -> str:
     db = make_array_decl(nb, tag, b)
     return wrap_try(idx, da + db + (
         f'    emit("case_{idx}", {op}<{ty}>({na}.view(), {nb}.view()));\n'
+    ))
+
+
+def mixed_binary_cpp(idx: int, case) -> str:
+    """Mixed-dtype binary: uses the litenp template overload
+    `op<A,B>(ArrayView<const A>, ArrayView<const B>)` whose result type is
+    `promote_type<A,B>`. We declare two arrays of distinct element types and
+    emit the result via the same template instantiation that NumPy's
+    `result_type` would predict.
+
+    true_divide is special: its integral operands promote to double (NumPy
+    semantics), implemented via litenp's true_divide<A,B> mixed overload."""
+    _, ta, tb, op, a, b = case
+    na, nb = f"ma{idx}", f"mb{idx}"
+    ca, cb = cpp_name(ta), cpp_name(tb)
+    da = make_array_decl(na, ta, a)
+    db = make_array_decl(nb, tb, b)
+    return wrap_try(idx, da + db + (
+        f'    emit("case_{idx}", {op}<{ca}, {cb}>({na}.view(), {nb}.view()));\n'
     ))
 
 
@@ -488,9 +668,27 @@ def np_binary(op, a, b):
     if op == "subtract": return a - b
     if op == "multiply": return a * b
     if op == "divide": return a / b
+    if op == "floor_divide": return np.floor_divide(a, b)
     if op == "minimum": return np.minimum(a, b)
     if op == "maximum": return np.maximum(a, b)
     raise ValueError(op)
+
+
+def np_mixed_binary(op, a, b):
+    """Mixed-dtype binary: NumPy promotes the two operands via
+    np.result_type before computing; the result dtype is the common type.
+    The litenp oracle path emits values via static_cast<double>, so we coerce
+    both operands to the promoted dtype first to match arithmetic semantics
+    (e.g. u64 + i64 -> float64, which NumPy represents exactly).
+
+    true_divide: NumPy always returns float for integer operands; we model
+    this with np.true_divide which produces float64 for integer inputs."""
+    if op == "true_divide":
+        return np.true_divide(a, b)
+    rtype = np.result_type(a.dtype, b.dtype)
+    aa = a.astype(rtype, copy=False)
+    bb = b.astype(rtype, copy=False)
+    return np_binary(op, aa, bb)
 
 
 def np_compare(op, a, b):
@@ -619,6 +817,7 @@ def main() -> None:
 
     unary = gen_unary_cases(rng, CASES)
     binary = gen_binary_cases(rng, CASES)
+    mixed_binary = gen_mixed_binary_cases(rng, CASES)
     broadcast = gen_broadcast_cases(rng, CASES)
     compare = gen_comparison_cases(rng, CASES)
     reduce = gen_reduction_cases(rng, CASES)
@@ -634,6 +833,8 @@ def main() -> None:
         parts.append(unary_cpp(idx, c)); idx += 1
     for c in binary:
         parts.append(binary_cpp(idx, c)); idx += 1
+    for c in mixed_binary:
+        parts.append(mixed_binary_cpp(idx, c)); idx += 1
     for c in broadcast:
         parts.append(broadcast_cpp(idx, c)); idx += 1
     for c in compare:
@@ -753,12 +954,22 @@ def main() -> None:
     n0 = len(unary)
     for i, c in enumerate(binary):
         _, tag, op, a, b = c
-        check_array_thunk(f"case_{n0 + i}", lambda op=op, a=a, b=b: np_binary(op, a, b), nan_safe=True)
+        nan_safe = is_float(tag)
+        check_array_thunk(f"case_{n0 + i}", lambda op=op, a=a, b=b: np_binary(op, a, b), nan_safe=nan_safe)
 
     n0 += len(binary)
+    for i, c in enumerate(mixed_binary):
+        _, ta, tb, op, a, b = c
+        # mixed-binary result is always the promoted type; if either operand
+        # is float, NaN propagation must match.
+        nan_safe = is_float(ta) or is_float(tb)
+        check_array_thunk(f"case_{n0 + i}", lambda op=op, a=a, b=b: np_mixed_binary(op, a, b), nan_safe=nan_safe)
+
+    n0 += len(mixed_binary)
     for i, c in enumerate(broadcast):
         _, tag, op, a, b = c
-        check_array_thunk(f"case_{n0 + i}", lambda op=op, a=a, b=b: np_binary(op, a, b), nan_safe=True)
+        nan_safe = is_float(tag)
+        check_array_thunk(f"case_{n0 + i}", lambda op=op, a=a, b=b: np_binary(op, a, b), nan_safe=nan_safe)
 
     n0 += len(broadcast)
     for i, c in enumerate(compare):
@@ -783,9 +994,13 @@ def main() -> None:
     n0 += len(slc)
     for i, c in enumerate(astype):
         _, tag, target, arr = c
+        # capture last failure detail for debugging
+        before = failures
         check_array_thunk(f"case_{n0 + i}",
                           lambda arr=arr, target=target: np_astype(arr, target),
                           nan_safe=is_float(target))
+        if failures > before:
+            print(f"  [debug astype case_{n0+i} FAIL] src={tag} -> {target}; arr={arr.tolist()}")
 
     n0 += len(astype)
     for i, c in enumerate(bcast_to):

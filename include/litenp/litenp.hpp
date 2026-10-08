@@ -1018,8 +1018,12 @@ inline void add_contiguous(const T* LITENP_RESTRICT a, const T* LITENP_RESTRICT 
     T av{};
     T bv{};
     if (known_uniform_value(a, n, &av) && known_uniform_value(b, n, &bv)) {
-        fill_contiguous(out, av + bv, n);
-        mark_uniform(out, n, static_cast<T>(av + bv));
+        // C++ integer promotion makes `av + bv` an `int` for small integer
+        // types (e.g. signed char + signed char). Cast back to T so the
+        // fill_contiguous template can deduce a single element type.
+        const T result = static_cast<T>(av + bv);
+        fill_contiguous(out, result, n);
+        mark_uniform(out, n, result);
         return;
     }
     clear_uniform(out);
@@ -3139,6 +3143,39 @@ inline void copy_strided_blocks_contiguous(
     }
 }
 
+// Float→int cast matching NumPy 2.x semantics: NumPy routes the value through
+// a signed 64-bit intermediate (truncation toward zero) and then wraps the
+// bits into the destination integer type — so -3.0f → uint8 yields 253, not
+// 0. NaN maps to 0 (matching NumPy's "invalid value encountered in cast"
+// path). Values outside int64 range are implementation-defined in both NumPy
+// and here; we clamp the int64 step to avoid C++ undefined behavior.
+// Integer→integer narrowing and signedness flips stay on the raw
+// static_cast path, where wrap is well-defined in C++ for the unsigned side.
+template <typename To, typename From>
+inline To saturate_cast(From v) {
+    if constexpr (std::is_integral<To>::value && std::is_floating_point<From>::value) {
+        if (std::isnan(v)) {
+            return To{0};
+        }
+        std::int64_t iv;
+        if (v < static_cast<From>(std::numeric_limits<std::int64_t>::lowest())) {
+            iv = std::numeric_limits<std::int64_t>::lowest();
+        } else if (v > static_cast<From>(std::numeric_limits<std::int64_t>::max())) {
+            iv = std::numeric_limits<std::int64_t>::max();
+        } else {
+            iv = static_cast<std::int64_t>(v);
+        }
+        if constexpr (std::is_unsigned<To>::value) {
+            // bit-reinterpret the int64 bits as uint64, then narrow to target
+            return static_cast<To>(static_cast<std::uint64_t>(iv));
+        } else {
+            return static_cast<To>(iv);
+        }
+    } else {
+        return static_cast<To>(v);
+    }
+}
+
 template <typename To, typename From>
 inline void astype_contiguous(const From* LITENP_RESTRICT input, To* LITENP_RESTRICT out, std::size_t n) {
 #if defined(__AVX2__)
@@ -3187,13 +3224,13 @@ inline void astype_contiguous(const From* LITENP_RESTRICT input, To* LITENP_REST
             }
         }
         for (; i < n; ++i) {
-            out[i] = static_cast<To>(input[i]);
+            out[i] = saturate_cast<To>(input[i]);
         }
         return;
     }
 #endif
     for (std::size_t i = 0; i < n; ++i) {
-        out[i] = static_cast<To>(input[i]);
+        out[i] = saturate_cast<To>(input[i]);
     }
 }
 
@@ -5664,7 +5701,7 @@ template <typename To, typename From>
 Array<To> astype(ArrayView<const From> view) {
     From uniform{};
     if (view.is_contiguous() && detail::known_uniform_value(view.data(), view.size(), &uniform)) {
-        return detail::make_uniform_array<To>(view.shape(), static_cast<To>(uniform));
+        return detail::make_uniform_array<To>(view.shape(), detail::saturate_cast<To>(uniform));
     }
     Array<To> out = detail::make_uninitialized_array<To>(view.shape());
     To* out_data = out.data();
@@ -5675,7 +5712,7 @@ Array<To> astype(ArrayView<const From> view) {
     Shape index;
     for (std::size_t i = 0; i < out.size(); ++i) {
         detail::linear_to_index(i, view.shape(), index);
-        out_data[i] = static_cast<To>(view.data()[detail::offset_for_index(index, view.strides())]);
+        out_data[i] = detail::saturate_cast<To>(view.data()[detail::offset_for_index(index, view.strides())]);
     }
     return out;
 }

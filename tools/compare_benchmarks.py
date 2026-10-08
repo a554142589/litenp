@@ -98,6 +98,13 @@ def format_ratio(value: Optional[float]) -> str:
 
 
 def row_status(required: bool, ratios: Iterable[tuple[str, bool, Optional[float]]]) -> str:
+    # Rows marked `required: false` are diagnostic: they ship evidence (e.g.
+    # dense-random kernels where litenp is not yet competitive with NumPy)
+    # without gating the pass/fail report, so a slow ratio must not flip them
+    # to "fail" and a missing optional baseline must not flip them to
+    # "uncovered". Only required rows participate in the gate.
+    if not required:
+        return "diagnostic"
     missing = [name for name, needed, value in ratios if needed and value is None]
     failing = [name for name, needed, value in ratios if needed and value is not None and value < 1.0]
     if missing:
