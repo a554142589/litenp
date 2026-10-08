@@ -40,6 +40,11 @@
   - `tests/test_libtorch_oracle.py` —— libtorch 基线。
 - **L4 性能基准**：`benchmarks/bench_litenp.cpp`（含 Eigen / libtorch 可选基线）+
   `benchmarks/bench_numpy.py`，由 `tools/compare_benchmarks.py` 生成 pass/fail 报告。
+  基准行分三组：
+  - `structured` —— uniform / metadata 输入，验证结构感知快路径与视图零拷贝；
+  - `dense-patterned` —— `(idx % N)` 模式数据，验证具体化稠密核；
+  - `dense-random` —— LCG 随机数据、非连续 strided 物化与多尺寸随机 matmul，
+    行标记 `required=false`（diagnostic），不参与 pass/fail gate。
 - **L5 跨平台矩阵**：见 §6。
 
 ## 3. API 覆盖矩阵
@@ -87,6 +92,7 @@
 | 算子 | L2 单元 | L3 NumPy | L3 libtorch | L4 基准 | 备注 |
 | --- | :-: | :-: | :-: | :-: | --- |
 | `add` / `subtract` / `multiply` / `divide` | ✓ | ✓ | ✓ | ✓ | 广播 + 标量 + 混合 dtype |
+| `floor_divide` / `true_divide` | ✓ | ✓ | ✓ | — | 整数除法对齐 NumPy：`floor_divide` 向 -∞ 取整（`np.floor_divide`），`true_divide` 整数提升为 `double`（`np.true_divide`） |
 | `minimum` / `maximum` | ✓ | ✓ | ✓ | ✓ | |
 | 运算符 `+ - * /`（Array/Array、Array/scalar、scalar/Array） | ✓ | ✓ | ✓ | — | |
 
@@ -128,15 +134,20 @@
 5. **形状不匹配**：二元算子广播失败抛 `invalid_argument`；`broadcast_to` 对低秩目标
    （input ndim > target ndim）抛 `invalid_argument`。
 6. **极端尺寸**：`16M` 元素稠密核、`2048²` 归约与转置、`1024` 矩阵乘。
-7. **非均匀数据**：`arange` / 随机模式输入，避免结构感知捷径掩盖稠密核缺陷。
+7. **非均匀数据**：`arange` / 随机模式输入（L3 differential 随机数据、L4 dense-random
+   组），避免结构感知捷径掩盖稠密核缺陷。
 8. **步长切片**：`slice(axis, begin, end, step)`，含 `step>1`、负 step 反向切片，
    以及 `litenp::SLICE_OPEN` 省略 `begin`/`end`（Python 风格）。步幅为有符号
    `ptrdiff_t`，负步幅经 `data_ + ptrdiff_t` 实现合法指针运算（非 unsigned 补码 hack）。
 9. **类型提升**：`int32 + float` → `double`、`int64 + uint64` → `double`、
    `int32 + uint32` → `int64`（NumPy 兼容 `promote_type`，kind+bits 规则，100 对
    dtype 笛卡尔矩阵全过 `np.result_type`）；`astype<float>(int_array)`。
-10. **除法语义**：`divide` 对整数遵循 C++ 截断语义；`true_divide` 对整数提升为
-    `double`（对齐 NumPy `np.true_divide`）。
+10. **除法语义**：NumPy `a / b` 对整数是 true division（返回 `float64`），而 C++ `/`
+    对整数截断，故 litenp 整数除法不走 `divide`：同 dtype 用 `floor_divide`
+    （向 -∞ 取整，对齐 `np.floor_divide`，含 0 除数守卫防 SIGFPE）；混合 dtype /
+    整数提升语义用 `true_divide`（整数提升为 `double`，对齐 `np.true_divide`）。
+    浮点 `divide` 与 NumPy `a / b` 一致；`astype` 浮点转整数按 NumPy 规则经
+    `int64` 中间截断后回绕到目标类型（非饱和）。
 11. **视图生命周期**：源 Array 析构后视图不可用（文档约束，测试中显式避免）。
 
 ## 5. 容差与对齐约定
@@ -235,12 +246,14 @@
 1. `ctest`（Release + Debug + ASan/UBSan）全部通过。
 2. `test_numpy_oracle.py`、`test_differential.py`（至少 1 个 seed）、
    `test_dtype_matrix.py` 与 `test_libtorch_oracle.py` 全部通过。
-3. `compare_benchmarks.py` 报告 `pass >= 68` 且 `fail == 0`、`uncovered == 0`。
+3. `compare_benchmarks.py` 报告 `pass >= 68` 且 `fail == 0`、`uncovered == 0`
+   （dense-random 组为 diagnostic 行，`required=false`，不计入 gate）。
 4. CI 矩阵（§6.1）全部 job 通过（含 `differential-oracle` 多 seed 矩阵）。
 5. API 覆盖矩阵（§3）中所有算子在 L3 层至少有一个 oracle 用例。
 
 ## 9. 与现有文档的关系
 
 - `docs/api_compatibility.md`：定义支持的语义子集，本计划的覆盖矩阵以其为准。
-- `docs/benchmark_methodology.md`：定义性能基准的两类行（结构感知 / 稠密）与读数规则。
+- `docs/benchmark_methodology.md`：定义性能基准的三组行（structured /
+  dense-patterned / dense-random）与读数规则。
 - `docs/benchmark_*.md`：历史性能快照。
