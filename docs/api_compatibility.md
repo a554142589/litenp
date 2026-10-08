@@ -11,14 +11,15 @@ subset.
 | --- | --- | --- | --- |
 | Owning array | `Array<T>` | `numpy.ndarray` / `torch.Tensor` CPU storage | Row-major contiguous owner. |
 | View | `ArrayView<T>` | ndarray/tensor view | Non-owning, shape plus strides. |
-| Shape metadata | `shape`, `strides`, `ndim`, `size` | `.shape`, `.strides`, `.ndim`, `.size` | Strides are in element counts, not bytes. |
+| Shape metadata | `shape`, `strides`, `ndim`, `size` | `.shape`, `.strides`, `.ndim`, `.size` | Strides are **signed** element counts (`Strides = std::vector<std::ptrdiff_t>`); negative strides traverse an axis backwards. This keeps `data_ + offset` well-defined C++ pointer arithmetic even for reverse slices, instead of an unsigned two's-complement hack. |
 | Reshape/flatten | `reshape`, `flatten` | `reshape`, `ravel`/`flatten` | Requires contiguous input. |
-| Slice/select | `slice`, `select` | basic slicing / `select` | Step must be positive. |
+| Slice/select | `slice`, `select` | basic slicing / `select` | `step` may be positive or negative (reverse). Pass `litenp::SLICE_OPEN` (sentinel `PTRDIFF_MIN`) to omit `begin` or `end`, mirroring Python's omitted slice bounds. |
 | Transpose/permute | `transpose`, `permute` | `.T`, `transpose`, `permute` | View operation unless materialized. |
 | Squeeze/unsqueeze | `squeeze`, `unsqueeze` | `squeeze`, `expand_dims` / `unsqueeze` | Runtime shape checks. |
 | Construction | `zeros`, `ones`, `full`, `arange`, `linspace`, `eye`, `identity` | matching constructors | Some constructors may be lazy. |
-| Elementwise binary | `+`, `-`, `*`, `/`, `minimum`, `maximum` | ufuncs / tensor ops | NumPy-style trailing-axis broadcasting. |
-| Scalar binary | scalar overloads | scalar-array ops | Mixed arithmetic promotes with `std::common_type_t`. |
+| Elementwise binary | `+`, `-`, `*`, `/`, `minimum`, `maximum` | ufuncs / tensor ops | NumPy-style trailing-axis broadcasting via unified `BroadcastPlan` (output shape and per-operand strides precomputed once). `broadcast_to` rejects lower-rank targets. |
+| Scalar binary | scalar overloads | scalar-array ops | Mixed arithmetic promotes with NumPy-compatible `promote_type` (kind+bits rule; e.g. `int32 + float -> double`, `int64 + uint64 -> double`, `int32 + uint32 -> int64`). Verified against `np.result_type` for all 100 dtype pairs. |
+| Division | `divide`, `true_divide`, `floor_divide` | `/`, `np.true_divide`, `np.floor_divide` | `divide` follows **C++ semantics** for integral operands (`int/int -> int` truncation). `true_divide` follows NumPy: integral operands promote to `double`. `floor_divide` mirrors `np.floor_divide`. |
 | Unary | `negative`, `abs`, `relu`, `sqrt`, `exp`, `sigmoid` | NumPy ufuncs / torch ops | `relu` and `sigmoid` mirror common tensor behavior. |
 | Comparison | `less`, `less_equal`, `greater`, `greater_equal`, `equal`, `not_equal` | comparison ufuncs | Output is `Array<std::uint8_t>` mask, not `bool`. |
 | Selection | `where` / `where_into` | `np.where` / `torch.where` | Mask uses nonzero as true. |
@@ -47,19 +48,27 @@ subset.
 
 ## Compatibility Verification
 
-The C++ unit tests cover edge cases and aliasing. In addition, CI runs
-`tests/test_numpy_oracle.py`, which compiles a small C++ program against the
-installed header and compares representative `litenp` results with NumPy:
+The C++ unit tests cover edge cases and aliasing. In addition, CI runs two
+complementary NumPy behavioral oracles, each compiling a small C++ program
+against the installed header and comparing `litenp` results with NumPy:
 
-- broadcasting and scalar arithmetic;
-- unary operations;
-- comparison and `where`;
-- `clip`;
-- axis reductions;
-- transpose and strided materialization;
-- `matmul` on non-uniform inputs;
-- `astype`.
+- `tests/test_numpy_oracle.py` — representative fixed cases for every operator
+  (construction, views, unary, binary, comparison, `where`/`clip`, axis
+  reductions, `concatenate`/`stack`, `matmul`, `astype`, broadcasting,
+  `cumsum`, NaN propagation).
+- `tests/test_differential.py` — property-based random differential tests.
+  Each run seeds a Python RNG, generates randomized inputs (varying shape,
+  dtype, NaN injection, empty arrays, broadcasting, negative-step slicing,
+  `broadcast_to`, `cumsum`), and verifies that every supported operator
+  matches NumPy element-for-element or matches NumPy's raised exception
+  (e.g. empty `max`/`mean`). Override the seed with `SEED=` and case count
+  with `CASES=`; CI runs three fixed seeds.
+- `tests/test_dtype_matrix.py` — exhaustive dtype promotion matrix. Builds
+  the Cartesian 10x10 grid of supported dtypes (u8/i8/u16/i16/u32/i32/u64/i64
+  /f32/f64) and confirms `detail::promote_type<A, B>` equals
+  `np.result_type(A, B)` for all 100 pairs (including the
+  `int64 + uint64 -> float64` escape).
 
-This oracle test is intentionally behavioral. It does not use benchmark special
+Both oracles are intentionally behavioral. They do not use benchmark special
 cases as proof of functional equivalence.
 

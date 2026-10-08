@@ -69,7 +69,7 @@ void test_array_shape_and_view() {
     litenp::Array<float> a({2, 3});
     assert(reinterpret_cast<std::uintptr_t>(a.data()) % 32 == 0);
     assert(a.shape() == (litenp::Shape{2, 3}));
-    assert(a.strides() == (litenp::Shape{3, 1}));
+    assert(a.strides() == (litenp::Strides{3, 1}));
     expect_close(a({0, 0}), 0.0f);
     a.values()[0] = 2.0f;
     expect_close(a({0, 0}), 2.0f);
@@ -236,9 +236,9 @@ void test_shape_and_dtype_helpers() {
     auto lhs = litenp::Array<std::int32_t>::from_vector({2, 3}, {1, 2, 3, 4, 5, 6});
     auto rhs = litenp::Array<float>::from_vector({3}, {0.5f, 1.5f, 2.5f});
     auto mixed = lhs + rhs;
-    static_assert(std::is_same<decltype(mixed)::value_type, float>::value, "mixed op should use common_type");
-    expect_close(mixed({0, 0}), 1.5f);
-    expect_close(mixed({1, 2}), 8.5f);
+    static_assert(std::is_same<decltype(mixed)::value_type, double>::value, "int32+float should promote to double");
+    expect_close(mixed({0, 0}), 1.5);
+    expect_close(mixed({1, 2}), 8.5);
 }
 
 void test_broadcast_and_scalar_ops() {
@@ -648,8 +648,8 @@ void test_api_overload_consistency() {
     expect_close(c({0}), 9.0f);
     expect_close(d({1}), 6.0f);
     expect_close(e({2}), 2.0f);
-    expect_close(f({1}), 4.0f);
-    expect_close(g({2}), 6.0f);
+    expect_close(f({1}), 4.0);
+    expect_close(g({2}), 6.0);
 
     auto other = litenp::Array<float>::from_vector({3}, {1.0f, 3.0f, 4.0f});
     auto lt = litenp::less(a, other);
