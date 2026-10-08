@@ -53,7 +53,75 @@ using Shape = std::vector<std::size_t>;
 template <typename T>
 class Array;
 
+// Sentinel for "open" slice bounds (Python's omitted start/stop).
+// Use PTRDIFF_MIN to represent "no bound" in slice operations.
+inline constexpr std::ptrdiff_t SLICE_OPEN = std::numeric_limits<std::ptrdiff_t>::min();
+
 namespace detail {
+
+// ---- NumPy-compatible dtype promotion rules ----
+// Kind: 0=unsigned int, 1=signed int, 2=float
+template <typename T>
+struct dtype_meta {
+    static constexpr int kind = std::is_floating_point<T>::value ? 2
+                              : (std::is_signed<T>::value ? 1 : 0);
+    static constexpr int bits = static_cast<int>(sizeof(T) * 8);
+};
+
+template <int kind, int bits>
+struct dtype_from_meta {
+    using type = std::conditional_t<kind == 2,
+        std::conditional_t<bits <= 32, float, double>,
+        std::conditional_t<kind == 1,
+            std::conditional_t<bits <= 8, std::int8_t,
+                std::conditional_t<bits <= 16, std::int16_t,
+                    std::conditional_t<bits <= 32, std::int32_t, std::int64_t>>>,
+            std::conditional_t<bits <= 8, std::uint8_t,
+                std::conditional_t<bits <= 16, std::uint16_t,
+                    std::conditional_t<bits <= 32, std::uint32_t, std::uint64_t>>>
+        >
+    >;
+};
+
+template <typename A, typename B>
+struct promote_impl {
+private:
+    static constexpr int ka = dtype_meta<A>::kind;
+    static constexpr int kb = dtype_meta<B>::kind;
+    static constexpr int ba = dtype_meta<A>::bits;
+    static constexpr int bb = dtype_meta<B>::bits;
+
+    static constexpr int result_kind = (ka > kb) ? ka : kb;
+
+    static constexpr int compute_bits() {
+        if (ka == 2 && kb == 2) {
+            return (ba > bb) ? ba : bb;
+        }
+        if (ka == 2 || kb == 2) {
+            const int int_bits = (ka == 2) ? bb : ba;
+            const int flt_bits = (ka == 2) ? ba : bb;
+            if (flt_bits <= 32 && int_bits <= 16) return 32;
+            return 64;
+        }
+        if (ka == kb) {
+            return (ba > bb) ? ba : bb;
+        }
+        const int unsigned_bits = (ka == 0) ? ba : bb;
+        const int signed_bits = (ka == 1) ? ba : bb;
+        if (signed_bits > unsigned_bits) {
+            return signed_bits;
+        }
+        return (unsigned_bits * 2 > 64) ? 64 : unsigned_bits * 2;
+    }
+
+    static constexpr int result_bits = compute_bits();
+
+public:
+    using type = typename dtype_from_meta<result_kind, result_bits>::type;
+};
+
+template <typename A, typename B>
+using promote_type = typename promote_impl<A, B>::type;
 
 template <typename T>
 Array<T> make_uninitialized_array(Shape shape);
@@ -430,6 +498,49 @@ inline std::size_t broadcast_offset(
     return offset;
 }
 
+struct BroadcastPlan {
+    Shape output_shape;
+    Shape lhs_strides;
+    Shape rhs_strides;
+
+    static BroadcastPlan make(
+        const Shape& a_shape, const Shape& a_strides,
+        const Shape& b_shape, const Shape& b_strides)
+    {
+        const std::size_t ndim = std::max(a_shape.size(), b_shape.size());
+        Shape output_shape(ndim, 1);
+        Shape lhs_strides(ndim, 0);
+        Shape rhs_strides(ndim, 0);
+
+        for (std::size_t i = 0; i < ndim; ++i) {
+            const std::size_t ar = ndim - i;
+            const std::size_t adim = ar <= a_shape.size() ? a_shape[a_shape.size() - ar] : 1;
+            const std::size_t bdim = ar <= b_shape.size() ? b_shape[b_shape.size() - ar] : 1;
+            if (adim != bdim && adim != 1 && bdim != 1) {
+                throw std::invalid_argument("shapes are not broadcast-compatible");
+            }
+            output_shape[i] = std::max(adim, bdim);
+            if (ar <= a_shape.size()) {
+                lhs_strides[i] = (adim == 1 && bdim != 1) ? 0 : a_strides[a_shape.size() - ar];
+            }
+            if (ar <= b_shape.size()) {
+                rhs_strides[i] = (bdim == 1 && adim != 1) ? 0 : b_strides[b_shape.size() - ar];
+            }
+        }
+        return {std::move(output_shape), std::move(lhs_strides), std::move(rhs_strides)};
+    }
+};
+
+inline std::size_t broadcast_offset_fast(
+    const Shape& out_index, const Shape& bcast_strides)
+{
+    std::size_t offset = 0;
+    for (std::size_t i = 0; i < out_index.size(); ++i) {
+        offset += out_index[i] * bcast_strides[i];
+    }
+    return offset;
+}
+
 enum class BinaryOp {
     Add,
     Sub,
@@ -615,7 +726,9 @@ inline T apply_unary(T x, UnaryOp op) {
         case UnaryOp::Abs:
             return static_cast<T>(std::abs(x));
         case UnaryOp::Relu:
-            return std::max(T{}, x);
+            // NumPy semantics: np.maximum(x, 0) propagates NaN (relu(nan)=nan).
+            // std::max(T{}, x) would return 0 for NaN, so guard explicitly.
+            return (x != x) ? x : std::max(T{}, x);
         case UnaryOp::Sqrt:
             return static_cast<T>(std::sqrt(static_cast<double>(x)));
         case UnaryOp::Exp:
@@ -4273,19 +4386,48 @@ public:
         return reshape({size()});
     }
 
-    ArrayView<T> slice(std::size_t axis, std::size_t begin, std::size_t end) const {
+    ArrayView<T> slice(std::size_t axis, std::ptrdiff_t begin, std::ptrdiff_t end) const {
         return slice(axis, begin, end, 1);
     }
 
-    ArrayView<T> slice(std::size_t axis, std::size_t begin, std::size_t end, std::size_t step) const {
+    ArrayView<T> slice(std::size_t axis, std::ptrdiff_t begin, std::ptrdiff_t end, std::ptrdiff_t step) const {
         detail::require(axis < ndim(), "slice axis out of range");
-        detail::require(step > 0, "slice step must be positive");
-        detail::require(begin <= end && end <= shape_[axis], "invalid slice range");
+        detail::require(step != 0, "slice step must not be zero");
+
+        const std::ptrdiff_t dim = static_cast<std::ptrdiff_t>(shape_[axis]);
+        const bool begin_open = (begin == litenp::SLICE_OPEN);
+        const bool end_open = (end == litenp::SLICE_OPEN);
+
+        if (step > 0) {
+            if (begin_open) begin = 0;
+            else { if (begin < 0) begin += dim; if (begin < 0) begin = 0; }
+            if (end_open) end = dim;
+            else { if (end < 0) end += dim; if (end > dim) end = dim; }
+            detail::require(begin <= end, "invalid slice range");
+
+            Shape out_shape = shape_;
+            Shape out_strides = strides_;
+            out_shape[axis] = static_cast<std::size_t>((end - begin + step - 1) / step);
+            out_strides[axis] *= static_cast<std::size_t>(step);
+            return ArrayView<T>(data_ + static_cast<std::size_t>(begin) * strides_[axis],
+                                 std::move(out_shape), std::move(out_strides), base_data_);
+        }
+
+        // Negative step: traverse backwards
+        if (begin_open) begin = dim - 1;
+        else { if (begin < 0) begin += dim; if (begin >= dim) begin = dim - 1; if (begin < 0) begin = 0; }
+        if (end_open) end = -1;
+        else { if (end < 0) end += dim; if (end < -1) end = -1; }
+
+        const std::ptrdiff_t count = (begin - end + (-step) - 1) / (-step);
         Shape out_shape = shape_;
         Shape out_strides = strides_;
-        out_shape[axis] = (end - begin + step - 1) / step;
-        out_strides[axis] *= step;
-        return ArrayView<T>(data_ + begin * strides_[axis], std::move(out_shape), std::move(out_strides), base_data_);
+        out_shape[axis] = static_cast<std::size_t>(count > 0 ? count : 0);
+        // Store negative stride as two's complement unsigned (wraps correctly in offset computation)
+        out_strides[axis] = static_cast<std::size_t>(
+            static_cast<std::ptrdiff_t>(strides_[axis]) * step);
+        return ArrayView<T>(data_ + static_cast<std::size_t>(begin) * strides_[axis],
+                             std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> select(std::size_t axis, std::size_t index) const {
@@ -5461,11 +5603,12 @@ void binary_into(ArrayView<const T> a, ArrayView<const T> b, ArrayView<T> out, d
         }
     }
 
+    auto plan = detail::BroadcastPlan::make(a.shape(), a.strides(), b.shape(), b.strides());
     Shape out_index;
     for (std::size_t i = 0; i < out.size(); ++i) {
-        detail::linear_to_index(i, out_shape, out_index);
-        const std::size_t ao = detail::broadcast_offset(out_index, out_shape, a.shape(), a.strides());
-        const std::size_t bo = detail::broadcast_offset(out_index, out_shape, b.shape(), b.strides());
+        detail::linear_to_index(i, plan.output_shape, out_index);
+        const std::size_t ao = detail::broadcast_offset_fast(out_index, plan.lhs_strides);
+        const std::size_t bo = detail::broadcast_offset_fast(out_index, plan.rhs_strides);
         out.data()[detail::offset_for_index(out_index, out.strides())] =
             detail::apply_binary(a.data()[ao], b.data()[bo], op);
     }
@@ -5733,7 +5876,7 @@ Array<T> binary(ArrayView<const T> a, ArrayView<const T> b, detail::BinaryOp op)
 template <
     typename A,
     typename B,
-    typename R = std::common_type_t<A, B>,
+    typename R = detail::promote_type<A, B>,
     typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> binary(ArrayView<const A> a, ArrayView<const B> b, detail::BinaryOp op) {
     const Shape out_shape = detail::broadcast_shape(a.shape(), b.shape());
@@ -5804,11 +5947,12 @@ Array<R> binary(ArrayView<const A> a, ArrayView<const B> b, detail::BinaryOp op)
             }
         }
     }
+    auto plan = detail::BroadcastPlan::make(a.shape(), a.strides(), b.shape(), b.strides());
     Shape out_index;
     for (std::size_t i = 0; i < out.size(); ++i) {
-        detail::linear_to_index(i, out_shape, out_index);
-        const std::size_t ao = detail::broadcast_offset(out_index, out_shape, a.shape(), a.strides());
-        const std::size_t bo = detail::broadcast_offset(out_index, out_shape, b.shape(), b.strides());
+        detail::linear_to_index(i, plan.output_shape, out_index);
+        const std::size_t ao = detail::broadcast_offset_fast(out_index, plan.lhs_strides);
+        const std::size_t bo = detail::broadcast_offset_fast(out_index, plan.rhs_strides);
         out[i] = detail::apply_binary(
             static_cast<R>(a.data()[ao]),
             static_cast<R>(b.data()[bo]),
@@ -5928,7 +6072,7 @@ Array<T> add(ArrayView<const T> a, ArrayView<const T> b) {
     return binary(a, b, detail::BinaryOp::Add);
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> add(ArrayView<const A> a, ArrayView<const B> b) {
     return binary<A, B, R>(a, b, detail::BinaryOp::Add);
 }
@@ -5938,7 +6082,7 @@ Array<T> subtract(ArrayView<const T> a, ArrayView<const T> b) {
     return binary(a, b, detail::BinaryOp::Sub);
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> subtract(ArrayView<const A> a, ArrayView<const B> b) {
     return binary<A, B, R>(a, b, detail::BinaryOp::Sub);
 }
@@ -5948,7 +6092,7 @@ Array<T> multiply(ArrayView<const T> a, ArrayView<const T> b) {
     return binary(a, b, detail::BinaryOp::Mul);
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> multiply(ArrayView<const A> a, ArrayView<const B> b) {
     return binary<A, B, R>(a, b, detail::BinaryOp::Mul);
 }
@@ -5958,7 +6102,7 @@ Array<T> divide(ArrayView<const T> a, ArrayView<const T> b) {
     return binary(a, b, detail::BinaryOp::Div);
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> divide(ArrayView<const A> a, ArrayView<const B> b) {
     return binary<A, B, R>(a, b, detail::BinaryOp::Div);
 }
@@ -6051,22 +6195,22 @@ Array<T> operator/(const Array<T>& a, const Array<T>& b) {
     return divide(a, b);
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> operator+(const Array<A>& a, const Array<B>& b) {
     return add<A, B, R>(a.view(), b.view());
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> operator-(const Array<A>& a, const Array<B>& b) {
     return subtract<A, B, R>(a.view(), b.view());
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> operator*(const Array<A>& a, const Array<B>& b) {
     return multiply<A, B, R>(a.view(), b.view());
 }
 
-template <typename A, typename B, typename R = std::common_type_t<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
 Array<R> operator/(const Array<A>& a, const Array<B>& b) {
     return divide<A, B, R>(a.view(), b.view());
 }
@@ -6094,7 +6238,7 @@ Array<T> operator/(const Array<T>& a, T scalar) {
 template <
     typename T,
     typename Scalar,
-    typename R = std::common_type_t<T, Scalar>,
+    typename R = detail::promote_type<T, Scalar>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
 Array<R> operator+(const Array<T>& a, Scalar scalar) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6108,7 +6252,7 @@ Array<R> operator+(const Array<T>& a, Scalar scalar) {
 template <
     typename T,
     typename Scalar,
-    typename R = std::common_type_t<T, Scalar>,
+    typename R = detail::promote_type<T, Scalar>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
 Array<R> operator-(const Array<T>& a, Scalar scalar) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6122,7 +6266,7 @@ Array<R> operator-(const Array<T>& a, Scalar scalar) {
 template <
     typename T,
     typename Scalar,
-    typename R = std::common_type_t<T, Scalar>,
+    typename R = detail::promote_type<T, Scalar>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
 Array<R> operator*(const Array<T>& a, Scalar scalar) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6136,7 +6280,7 @@ Array<R> operator*(const Array<T>& a, Scalar scalar) {
 template <
     typename T,
     typename Scalar,
-    typename R = std::common_type_t<T, Scalar>,
+    typename R = detail::promote_type<T, Scalar>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<T, Scalar>::value>>
 Array<R> operator/(const Array<T>& a, Scalar scalar) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6172,7 +6316,7 @@ Array<T> operator/(T scalar, const Array<T>& a) {
 template <
     typename Scalar,
     typename T,
-    typename R = std::common_type_t<Scalar, T>,
+    typename R = detail::promote_type<Scalar, T>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
 Array<R> operator+(Scalar scalar, const Array<T>& a) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6186,7 +6330,7 @@ Array<R> operator+(Scalar scalar, const Array<T>& a) {
 template <
     typename Scalar,
     typename T,
-    typename R = std::common_type_t<Scalar, T>,
+    typename R = detail::promote_type<Scalar, T>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
 Array<R> operator-(Scalar scalar, const Array<T>& a) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6200,7 +6344,7 @@ Array<R> operator-(Scalar scalar, const Array<T>& a) {
 template <
     typename Scalar,
     typename T,
-    typename R = std::common_type_t<Scalar, T>,
+    typename R = detail::promote_type<Scalar, T>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
 Array<R> operator*(Scalar scalar, const Array<T>& a) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6214,7 +6358,7 @@ Array<R> operator*(Scalar scalar, const Array<T>& a) {
 template <
     typename Scalar,
     typename T,
-    typename R = std::common_type_t<Scalar, T>,
+    typename R = detail::promote_type<Scalar, T>,
     typename = std::enable_if_t<std::is_arithmetic<Scalar>::value && !std::is_same<Scalar, T>::value>>
 Array<R> operator/(Scalar scalar, const Array<T>& a) {
     Array<R> scalar_array({1}, static_cast<R>(scalar));
@@ -6291,11 +6435,12 @@ Array<std::uint8_t> compare(ArrayView<const T> a, ArrayView<const T> b, detail::
             }
         }
     }
+    auto plan = detail::BroadcastPlan::make(a.shape(), a.strides(), b.shape(), b.strides());
     Shape out_index;
     for (std::size_t i = 0; i < out.size(); ++i) {
-        detail::linear_to_index(i, out_shape, out_index);
-        const std::size_t ao = detail::broadcast_offset(out_index, out_shape, a.shape(), a.strides());
-        const std::size_t bo = detail::broadcast_offset(out_index, out_shape, b.shape(), b.strides());
+        detail::linear_to_index(i, plan.output_shape, out_index);
+        const std::size_t ao = detail::broadcast_offset_fast(out_index, plan.lhs_strides);
+        const std::size_t bo = detail::broadcast_offset_fast(out_index, plan.rhs_strides);
         out[i] = detail::apply_compare(a.data()[ao], b.data()[bo], op);
     }
     return out;
@@ -6489,12 +6634,15 @@ void where_into(ArrayView<const std::uint8_t> mask, ArrayView<const T> x, ArrayV
             }
         }
     }
+    auto mask_plan = detail::BroadcastPlan::make(mask.shape(), mask.strides(), out_shape, detail::contiguous_strides(out_shape));
+    auto x_plan = detail::BroadcastPlan::make(x.shape(), x.strides(), out_shape, detail::contiguous_strides(out_shape));
+    auto y_plan = detail::BroadcastPlan::make(y.shape(), y.strides(), out_shape, detail::contiguous_strides(out_shape));
     Shape out_index;
     for (std::size_t i = 0; i < out.size(); ++i) {
         detail::linear_to_index(i, out_shape, out_index);
-        const std::size_t mo = detail::broadcast_offset(out_index, out_shape, mask.shape(), mask.strides());
-        const std::size_t xo = detail::broadcast_offset(out_index, out_shape, x.shape(), x.strides());
-        const std::size_t yo = detail::broadcast_offset(out_index, out_shape, y.shape(), y.strides());
+        const std::size_t mo = detail::broadcast_offset_fast(out_index, mask_plan.lhs_strides);
+        const std::size_t xo = detail::broadcast_offset_fast(out_index, x_plan.lhs_strides);
+        const std::size_t yo = detail::broadcast_offset_fast(out_index, y_plan.lhs_strides);
         out.data()[detail::offset_for_index(out_index, out.strides())] =
             mask.data()[mo] ? x.data()[xo] : y.data()[yo];
     }

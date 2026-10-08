@@ -77,6 +77,25 @@ jobs:
         env:
           CXX: g++
 
+  # ---- L3: property-based differential oracle (random shape/dtype/NaN/empty) ----
+  differential-oracle:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ["20261008", "12345", "99"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NumPy
+        run: python3 -m pip install --upgrade pip numpy
+
+      - name: Run Differential Oracle (g++)
+        run: python3 tests/test_differential.py
+        env:
+          CXX: g++
+          SEED: ${{ matrix.seed }}
+
   # ---- L3: libtorch behavioral oracle ----
   libtorch-oracle:
     runs-on: ubuntu-22.04

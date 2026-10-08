@@ -88,6 +88,10 @@ int main() {
     emit("transpose", as_contiguous<float>(base.transpose()));
     emit("permute", as_contiguous<float>(permute(base, {1, 0})));
     emit("slice_step", as_contiguous<float>(base.view().slice(1, 0, 3, 2)));
+    emit("slice_neg_step", as_contiguous<float>(base.view().slice(1, 2, litenp::SLICE_OPEN, -1)));
+    emit("slice_neg_full", as_contiguous<float>(base.view().slice(1, litenp::SLICE_OPEN, litenp::SLICE_OPEN, -1)));
+    emit("slice_neg_skip", as_contiguous<float>(base.view().slice(1, litenp::SLICE_OPEN, litenp::SLICE_OPEN, -2)));
+    emit("slice_neg_row", as_contiguous<float>(base.view().slice(0, litenp::SLICE_OPEN, litenp::SLICE_OPEN, -1)));
     emit("select", as_contiguous<float>(base.view().select(0, 1)));
     auto sq = Array<float>::from_vector({1, 2, 1, 3}, {1, 2, 3, 4, 5, 6});
     emit("squeeze", sq.squeeze());
@@ -302,6 +306,10 @@ def main() -> None:
     check_close(rows, "transpose", np.ascontiguousarray(a.T))
     check_close(rows, "permute", np.ascontiguousarray(np.transpose(a, (1, 0))))
     check_close(rows, "slice_step", a[:, 0:3:2])
+    check_close(rows, "slice_neg_step", a[:, 2::-1])
+    check_close(rows, "slice_neg_full", a[:, ::-1])
+    check_close(rows, "slice_neg_skip", a[:, ::-2])
+    check_close(rows, "slice_neg_row", a[::-1, :])
     check_close(rows, "select", a[1, :])
     sq = np.array([[[[1, 2, 3]], [[4, 5, 6]]]], dtype=np.float32)  # shape (1,2,1,3)
     check_close(rows, "squeeze", sq.squeeze())
