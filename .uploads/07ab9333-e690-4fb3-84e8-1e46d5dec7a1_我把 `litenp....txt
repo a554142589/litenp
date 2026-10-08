@@ -1,0 +1,976 @@
+我把 `litenp` 的 README、benchmark methodology、benchmark 源码和核心 `litenp.hpp` 都过了一遍。结论和单看 README 会有明显区别。
+
+## 结论先行
+
+**`litenp` 是一个有价值、设计思路不错的轻量 C++ ndarray 库，但目前不应该被理解为“比 NumPy/PyTorch 更快的新一代替代品”。**
+
+更准确的定位是：
+
+> **litenp = C++17 下，面向 CPU、小中型数组、低依赖部署、低调用开销，并利用“数组结构信息”主动跳过无意义计算的专用 ndarray runtime。**
+
+而：
+
+> **NumPy = 成熟的通用 CPU 数值计算生态。**  
+> **PyTorch = Tensor + Autograd + CPU/GPU/编译器/分布式的机器学习计算平台。**
+
+所以，如果按“产品成熟度和通用能力”排序：
+
+**PyTorch / NumPy ≫ litenp**
+
+但如果限定成：
+
+**“纯 C++、CPU-only、不能带 Python/LibTorch、二进制和依赖要小、主要是几十个 ndarray 算子”**
+
+那么：
+
+**litenp 的工程价值非常高，甚至可能比 NumPy/LibTorch 更适合。**
+
+它目前的真正亮点不是“SIMD 比 NumPy 牛”，而是：
+
+**结构感知 + 极轻 runtime + 预分配 kernel + C++ 直接调用 + 针对性的 SIMD。**
+
+仓库作者自己的定位其实也比较克制：C++17、single public header、无 NumPy/Eigen/libtorch/OpenMP/BLAS 强制依赖，并明确称自己只覆盖 NumPy/libtorch CPU tensor semantics 的一个 compact subset，而不是完整替代品。[GitHub](https://github.com/a554142589/litenp)
+
+---
+
+# 1. 三者根本不是同一个量级的东西
+
+| 维度 | litenp | NumPy | PyTorch |
+|---|---|---|---|
+| 核心定位 | 轻量 C++ ndarray | Python 通用数值计算 | AI/ML Tensor 平台 |
+| 主 API | C++17 | Python | Python + LibTorch C++ |
+| Runtime 依赖 | 极低 | Python + NumPy | 较重 |
+| CPU Tensor | ✅ | ✅✅✅ | ✅✅✅ |
+| SIMD | AVX2/FMA，自定义 kernel | 高度成熟、多 ISA dispatch | ATen / oneDNN / MKL 等 |
+| BLAS | 可选 CBLAS | 成熟 BLAS 生态 | 成熟 backend |
+| GPU | ❌ | 核心 NumPy ❌ | ✅ CUDA/ROCm/MPS/XPU 等 |
+| Autograd | ❌ | ❌ | ✅ |
+| `torch.compile` 类编译 | ❌ | ❌ | ✅ |
+| Distributed | ❌ | ❌ | ✅ |
+| Batched matmul | ❌ | ✅ | ✅ |
+| 高级 indexing | 很有限 | ✅✅✅ | ✅✅✅ |
+| FFT | ❌ | ✅ | ✅ |
+| Random | 非主要能力 | ✅ | ✅ |
+| Complex | 不完整/非目标 | ✅ | ✅ |
+| dtype 系统 | C++ template | 完整动态 dtype | 完整 Tensor dtype |
+| Python 生态 | ❌ | 极强 | 极强 |
+| 部署复杂度 | **极低** | 中 | 高 |
+| 项目成熟度 | **早期** | 极成熟 | 极成熟 |
+
+当前 `litenp` 公开仓库只有约 **14 commits、1 star、0 fork**，这是判断生产成熟度时不能忽略的信息；它说明目前主要还是作者驱动项目，而不是经过大量真实用户和平台组合打磨的基础设施。[GitHub](https://github.com/a554142589/litenp)
+
+相比之下，截至 2026 年 10 月，NumPy 已到 **2.5.3**，PyTorch 已到 **2.14**；PyTorch 2.14 仍在扩展 NVIDIA、ROCm、Intel XPU、Apple Silicon 和 distributed/compiler 能力。[NumPy](https://numpy.org/news/)
+
+所以不能只根据一张 benchmark 表，把三者放在同一条“谁更快”的轴上。
+
+---
+
+# 2. litenp 最有意思的创新：不是 SIMD，而是 Structure-Aware Array
+
+这是我认为这个项目最值得肯定的地方。
+
+普通 NumPy：
+
+```text
+ones(100000000)
+↓
+真的认为这是 1 亿个 float
+```
+
+而 litenp 可以把它理解成：
+
+```text
+shape = [100000000]
+semantic = Uniform
+value = 1
+```
+
+也就是说：
+
+**“这个数组所有位置都是 1”本身就是数据。**
+
+类似地，它维护：
+
+```text
+Uniform
+Arange
+Eye
+TwoBlock
+```
+
+这样的结构信息。
+
+所以：
+
+```cpp
+ones(...)
+full(...)
+eye(...)
+```
+
+有时根本不需要分配/填满整个 buffer；直到真正请求 `data()`、`view()`、`values()` 时才物化。README 和源码都明确实现了这种 virtual representation。[GitHub](https://github.com/a554142589/litenp)
+
+这带来了非常夸张的 benchmark：
+
+| 操作 | litenp | NumPy | 表面 speedup |
+|---|---:|---:|---:|
+| ones 4M | 0.000031 ms | 0.354 ms | 11,427× |
+| full 4M | 0.000031 ms | 0.346 ms | 11,153× |
+| eye 1024² | 0.000032 ms | 0.087 ms | 2,727× |
+| uniform sum | 0.002 ms | 0.469 ms | 234× |
+| uniform matmul 1024 | 0.246 ms | 41.2 ms | 167× | :chatgpt-content-reference{index="4"}
+
+
+这些数字**基本是真的**，但意义不是：
+
+> litenp 的 CPU 比 NumPy 快一万倍。
+
+而是：
+
+> litenp **知道根本没必要执行这次计算**。
+
+这是 symbolic/semantic optimization，而不是单纯 kernel optimization。
+
+这一点其实很有研究和工程价值。
+
+---
+
+# 3. 但这里有一个 benchmark 中非常关键的问题
+
+我继续追 benchmark 源码后，发现 README 里所谓的：
+
+> Materialized dense row
+
+有一部分依然受到了 **uniform metadata shortcut** 的巨大影响。
+
+最典型的是：
+
+## `add 4M`
+
+报告：
+
+```text
+litenp   0.3247 ms
+NumPy    1.4206 ms
+Eigen    1.3451 ms
+libtorch 2.4583 ms
+```
+
+看起来：
+
+```text
+litenp vs NumPy = 4.38×
+litenp vs Torch = 7.57×
+``` :chatgpt-content-reference{index="5"}
+
+
+但 benchmark 创建输入的方式是：
+
+```cpp
+auto a = Array<float>({n}, 1.25f);
+auto b = Array<float>({n}, 0.75f);
+``` :chatgpt-content-reference{index="6"}
+
+
+而 `Array(shape, value)` 构造函数会显式：
+
+```cpp
+mark_uniform(...)
+```
+
+记录：
+
+```text
+a = uniform 1.25
+b = uniform 0.75
+``` :chatgpt-content-reference{index="7"}
+
+
+接下来 `add_contiguous()` 的第一件事并不是 AVX2：
+
+```text
+if a is uniform && b is uniform:
+    fill(out, a_value + b_value)
+    return
+```
+
+源码就是这样实现的。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/main/include/litenp/litenp.hpp)
+
+所以这个 benchmark 实际比较的是：
+
+```text
+litenp:
+out[:] = 2.0
+
+vs
+
+NumPy:
+out[:] = a[:] + b[:]
+```
+
+NumPy 必须：
+
+```text
+读 A + 读 B + 写 C
+```
+
+litenp：
+
+```text
+只写 C
+```
+
+因此 **4.38× 并不能证明 litenp 的普通 dense add kernel 比 NumPy 快 4.38×。**
+
+这点非常重要。
+
+而官方 methodology 虽然已经明确提醒 structure-aware benchmark 不代表 generic dense 性能，并说未来还需要更多 random/patterned benchmark，但当前 `add` 被列进了 “Materialized Dense Kernels”，容易让读者高估这个数字。[GitHub](https://github.com/a554142589/litenp/blob/main/docs/benchmark_methodology.md)
+
+---
+
+# 4. 真正比较可信的性能结果是什么？
+
+有。
+
+例如：
+
+```text
+relu_into 4M     0.397 ms vs NumPy 1.464
+sqrt_into 4M     0.695 ms vs NumPy 1.579
+exp_into 4M      1.468 ms vs NumPy 3.479
+clip_into 4M     0.396 ms vs NumPy 1.702
+``` :chatgpt-content-reference{index="10"}
+
+
+这部分 benchmark 的输入确实是：
+
+```cpp
+a[i] = (i % 17 - 8) / 8
+```
+
+也就是非 uniform 数据，而 NumPy 端也采用类似 patterned input。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/main/benchmarks/bench_litenp.cpp)
+
+所以这一部分更能说明：
+
+> **在特定 x86 CPU + GCC + AVX2/FMA + 单线程 + contiguous float32 + preallocated output 场景，litenp 的定制 kernel 确实可以非常快。**
+
+这是可信的。
+
+源码也不是简单的 naive loop；可以看到：
+
+- AVX2/AVX512 conditional kernels
+- FMA
+- aligned load/store
+- non-temporal store
+- 4×8 / 8×8 / 4×16 / 6×16 GEMM micro-kernel
+- packing
+- OpenMP
+- optional CBLAS
+- 64-byte alignment
+- allocation cache
+
+等真正的 HPC 优化。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/main/include/litenp/litenp.hpp)
+
+所以这个项目绝不是“拿 lazy 技巧作弊”。
+
+更准确说：
+
+**有真正不错的 CPU kernel 工程能力，但公开 benchmark 又混入了大量 semantic shortcut，导致整体 speedup 数字看起来比普通 dense workload 实际情况更漂亮。**
+
+---
+
+# 5. `matmul 168×` 更不能理解成 GEMM 比 NumPy 快 168×
+
+源码尤其清楚。
+
+matmul 在真正选择：
+
+```text
+CBLAS
+6x16 packed
+4x16 packed
+8x8
+4x8
+AXPY
+```
+
+之前，会检查：
+
+```cpp
+all_contiguous_equal(A)
+all_contiguous_equal(B)
+```
+
+如果 A、B 都是常数矩阵，就直接算：
+
+```text
+cell = a × b × K
+fill(output, cell)
+``` :chatgpt-content-reference{index="13"}
+
+
+也就是说，普通矩阵乘法：
+
+\[
+O(MNK)
+\]
+
+被转化成近似：
+
+\[
+O(MK + KN + MN)
+\]
+
+其中主要工作甚至只是检测和填充输出。
+
+而 benchmark 恰恰使用：
+
+```text
+A[:] = 1.0
+B[:] = 0.5
+```
+
+NumPy 端则真执行 `np.matmul`。[GitHub](https://github.com/a554142589/litenp/blob/main/benchmarks/bench_numpy.py)
+
+所以：
+
+> **168× 是 structure algebra optimization 的成绩，不是 GEMM kernel 的成绩。**
+
+这是非常聪明的优化。
+
+但如果拿 random matrix：
+
+```cpp
+A = random(...)
+B = random(...)
+```
+
+这个数字会完全不同。
+
+而作者自己也在 benchmark methodology 里明确承认目前缺少：
+
+> random/patterned matmul
+
+并警告不要做 broad performance claim。[GitHub](https://github.com/a554142589/litenp/blob/main/docs/benchmark_methodology.md)
+
+这一点作者其实是诚实的。
+
+---
+
+# 6. 和 Torch 的 benchmark 还有一个公平性问题
+
+例如 `add`：
+
+litenp：
+
+```cpp
+add_into(a, b, out)
+```
+
+提前分配了 output。
+
+但是 Torch：
+
+```cpp
+to = ta + tb;
+```
+
+每次都会生成输出 Tensor。 [GitHub](https://raw.githubusercontent.com/a554142589/litenp/main/benchmarks/bench_litenp.cpp)
+
+
+这不是完全一致的对比。
+
+PyTorch 本身存在：
+
+```python
+torch.add(a, b, out=result)
+```
+
+的 out-buffer 形式。官方接口体系也支持 `out=` operator contract。[PyTorch Docs](https://docs.pytorch.org/docs/stable/notes/extending.html)
+
+所以：
+
+```text
+litenp add_into
+vs
+Torch a+b
+```
+
+把：
+
+```text
+kernel + Tensor allocation / dispatcher
+```
+
+一起算在 Torch 头上。
+
+对于真实应用，这种端到端差异当然有意义；但如果结论是：
+
+> “litenp add kernel 比 Torch 快 7.57×”
+
+那就不严谨。
+
+同样，`broadcast_into` / `where_into` 中也存在不同程度的 allocation contract 不完全一致的问题。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/main/benchmarks/bench_litenp.cpp)
+
+---
+
+# 7. 与 NumPy 的 metadata benchmark 也不是完全 apples-to-apples
+
+例如：
+
+```text
+reshape view x100K
+transpose view x100K
+slice view x100K
+```
+
+litenp 是：
+
+```text
+C++ → C++ direct call
+```
+
+NumPy benchmark 是：
+
+```text
+Python → NumPy API → C
+```
+
+官方结果：
+
+```text
+reshape     litenp ≈3.3×
+transpose   ≈2×
+slice       ≈6.4×
+``` :chatgpt-content-reference{index="19"}
+
+
+这部分工作每次只有几十纳秒到几百纳秒，因此 Python API dispatch/object 创建已经是很大的组成部分。
+
+所以它能说明：
+
+> **纯 C++ lightweight view object 非常轻。**
+
+但不能证明：
+
+> **litenp 的 stride/view 算法比 NumPy C 内核快 6×。**
+
+对于 C++ application 来说，这个优势是真的。
+
+对于 Python 用户来说，比较甚至没有太大意义，因为 litenp 当前本来就不是 Python library。
+
+---
+
+# 8. 单线程 benchmark 对 litenp 有利，但也合理
+
+官方 benchmark 强制：
+
+```text
+OMP_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+MKL_NUM_THREADS=1
+``` :chatgpt-content-reference{index="20"}
+
+
+这意味着测试的其实是：
+
+> 单核 latency / 单线程 kernel efficiency。
+
+而不是：
+
+> workstation/server 最大吞吐。
+
+对于小中型 CPU 算子，这是很合理的选择，因为线程启动本身可能得不偿失。
+
+但 NumPy/PyTorch 的一大优势恰恰是成熟的多线程 BLAS / runtime / backend。
+
+所以不能从这个 benchmark 推导：
+
+```text
+litenp > NumPy/Torch CPU performance
+```
+
+只能推导：
+
+```text
+特定单线程 workload 下 litenp 很有竞争力
+```
+
+而且官方也明确指出没有锁 CPU frequency、没有 core isolation、没有关闭 turbo，数据只能视作 single-machine evidence。[GitHub](https://github.com/a554142589/litenp/blob/main/docs/benchmark_methodology.md)
+
+---
+
+# 9. NumPy / Torch 真正领先的地方：语义成熟度
+
+这里差距比 performance 更大。
+
+litenp 的文档支持：
+
+```text
+Array
+ArrayView
+reshape
+slice
+transpose
+broadcast
++ - * /
+minimum maximum
+sqrt exp sigmoid
+comparison
+where
+clip
+sum mean max
+2D matmul
+concatenate
+stack
+astype
+```
+
+但明确存在：
+
+```text
+matmul 仅 2D
+slice step > 0
+mask = uint8
+reshape 要求 contiguous
+ArrayView 非 owning
+dtype promotion = std::common_type_t
+```
+
+等约束。[GitHub](https://github.com/a554142589/litenp/blob/main/docs/api_compatibility.md)
+
+而 NumPy 的 dtype promotion 本身已经是一套相当复杂的系统，例如 signed/unsigned integer、float、Python scalar 等都有精确定义；它显然不能简单等价为 C++ 的 `std::common_type_t`。[NumPy](https://numpy.org/doc/stable/reference/generated/numpy.promote_types.html)
+
+这类差异在图像/CV 中可能不明显，但在：
+
+```text
+uint8
+uint16
+int32
+float16
+float32
+float64
+NaN / Inf
+mixed dtype
+```
+
+混合计算时会逐渐暴露。
+
+---
+
+# 10. 我还发现至少一个明确的 NumPy 语义差异
+
+例如 `minimum/maximum`。
+
+litenp SIMD/普通路径使用：
+
+```cpp
+_mm256_min_ps
+std::min(...)
+``` :chatgpt-content-reference{index="24"}
+
+
+而 NumPy 的 `np.minimum` 明确定义：
+
+> 输入中出现 NaN 时传播 NaN。 :chatgpt-content-reference{index="25"}
+
+
+这两个行为并不完全相同。
+
+所以 README 中：
+
+> advertised operator behaves like matching NumPy/libtorch operation
+
+应该理解为：
+
+**目标如此，而不是已经实现了完整 bit-for-bit / edge-case semantic compatibility。**
+
+如果是普通视觉 float buffer，影响可能很小。
+
+如果是 scientific computing，则这是重要问题。
+
+---
+
+# 11. 当前源码新增功能还有明显“尚未工业化”的痕迹
+
+这是我认为评估这个项目成熟度时很关键的一点。
+
+现在源码已经比 compatibility 文档丰富很多，包括：
+
+```text
+nansum/nanmax/nanmin
+argmin/argmax
+cumsum
+sort
+argsort
+unique
+take
+searchsorted
+trace
+diagonal
+flip
+tile
+repeat
+broadcast_to
+softmax
+.npy save/load
+...
+``` :chatgpt-content-reference{index="26"}
+
+
+说明作者正在快速扩展 API。
+
+但一些实现还是“先实现正确/大致可用”的阶段。
+
+### cumsum
+
+当前代码对**每一个输出元素**：
+
+```cpp
+acc = 0
+for k = 0 .. current_index:
+    acc += input[k]
+``` :chatgpt-content-reference{index="27"}
+
+
+对于长度 N 的一维数组，复杂度接近：
+
+\[
+O(N^2)
+\]
+
+而正常 prefix sum 应该：
+
+\[
+O(N)
+\]
+
+这是数量级上的区别。
+
+---
+
+## 更值得注意的是 `broadcast_to`
+
+当前实现核心是：
+
+```cpp
+for i:
+    out[i] = d[i % input_size];
+``` :chatgpt-content-reference{index="28"}
+
+
+这并不等于一般的 NumPy multidimensional broadcasting。
+
+例如：
+
+```text
+input shape = (2,1)
+
+[[1],
+ [2]]
+```
+
+NumPy broadcast 到 `(2,3)` 应该：
+
+```text
+[[1,1,1],
+ [2,2,2]]
+```
+
+但上述 flattened modulo 逻辑会形成：
+
+```text
+[1,2,1,2,1,2]
+```
+
+reshape 后是：
+
+```text
+[[1,2,1],
+ [2,1,2]]
+```
+
+因此从当前源码来看，**这个 API 尚不能被认为具有完整 NumPy `broadcast_to` 语义。**
+
+这比 benchmark 的问题更重要：
+
+> litenp 当前最需要补的，不是再把 `relu` 从 0.40 ms 优化到 0.35 ms，而是 correctness / semantic completeness。
+
+---
+
+# 12. 不过 litenp 的内存设计有一些很好的工程想法
+
+它用了自定义 allocator。
+
+例如 zeroed allocation 在 Unix/macOS 上，大于 4096 bytes 会直接：
+
+```cpp
+mmap(... MAP_ANONYMOUS ...)
+``` :chatgpt-content-reference{index="29"}
+
+
+意味着可以充分利用 OS demand-zero page。
+
+所以：
+
+```text
+zeros(巨大数组)
+```
+
+的创建时间可能非常小，因为很多物理页还没真正发生写入。
+
+另外还存在：
+
+```text
+>= 1 MiB raw allocation cache
+thread_local cache
+64-byte alignment
+``` :chatgpt-content-reference{index="30"}
+
+
+这些设计很适合：
+
+```text
+image buffer
+temporary tensor
+CV preprocessing
+循环调用
+```
+
+这样的场景。
+
+这部分我给的评价反而挺高。
+
+---
+
+# 13. 真正的性能排序应该按 workload 来看
+
+| Workload | 我认为的排序 |
+|---|---|
+| C++ tiny tensor operation latency | **litenp 很强** |
+| uniform / eye / structured data | **litenp 可碾压** |
+| C++ ndarray，几十种简单算子 | **litenp 很有吸引力** |
+| 普通 contiguous elementwise CPU | litenp 有竞争力 |
+| random generic GEMM | NumPy/成熟 BLAS / Torch 更可信 |
+| 大规模多线程 CPU | NumPy/Torch 生态优势明显 |
+| 任意 dtype / broadcasting / indexing | **NumPy 明显领先** |
+| scientific computing | **NumPy 明显领先** |
+| ML inference/training | **Torch 完胜** |
+| GPU | **Torch 完胜** |
+| Autograd | **Torch 完胜** |
+| tiny deployment / no runtime deps | **litenp 完胜** |
+| API/edge-case correctness | **NumPy/Torch 完胜** |
+| 长期维护风险 | NumPy/Torch 明显更低 |
+
+所以如果一定给它一句话：
+
+> **litenp 的优势集中而尖锐；NumPy/Torch 的优势宽而深。**
+
+---
+
+# 14. 三者的架构哲学其实也不同
+
+NumPy 的基本思想接近：
+
+\[
+Array = Buffer + Shape + Stride + DType
+\]
+
+PyTorch：
+
+\[
+Tensor =
+Storage + Shape + Stride + DType + Device +
+Autograd + Dispatcher + Graph/Compiler
+\]
+
+而 litenp 正在尝试：
+
+\[
+Array =
+Buffer + Shape + Stride +
+\color{#555}{Semantic\ Structure}
+\]
+
+也就是说：
+
+```text
+“数组是什么”
+```
+
+不仅由每个 element 决定，
+
+还由：
+
+```text
+uniform
+arange
+identity
+two-block
+```
+
+这类高层语义决定。
+
+这是整个项目最值得继续发展的部分。
+
+从这个角度，我反而认为它不应该努力变成一个 **mini NumPy**。
+
+那条路线很难赢。
+
+---
+
+# 15. 如果继续发展 litenp，我会怎么定位
+
+我不会把目标定成：
+
+> Replace NumPy.
+
+也不会定成：
+
+> Faster than PyTorch.
+
+而是：
+
+> **Semantic-aware ndarray runtime for lightweight C++ numerical computing.**
+
+进一步把：
+
+```text
+Uniform
+Arange
+Eye
+TwoBlock
+```
+
+扩展成一个真正的小型 algebra：
+
+```text
+Constant
+Diagonal
+Identity
+Range
+Broadcast
+Repeated
+Block
+Sparse-mask
+Affine
+Low-rank
+Zero
+One-hot
+```
+
+然后让算子之间传播结构：
+
+\[
+Uniform(a)+Uniform(b)
+\rightarrow Uniform(a+b)
+\]
+
+\[
+Diagonal(A)\times Diagonal(B)
+\rightarrow Diagonal(A\odot B)
+\]
+
+\[
+Broadcast(x)+Broadcast(y)
+\rightarrow Broadcast(x+y)
+\]
+
+\[
+A\times I \rightarrow A
+\]
+
+\[
+A+0 \rightarrow A
+\]
+
+那就不是：
+
+> 一个缩水 NumPy。
+
+而变成：
+
+> **介于 ndarray 和 symbolic tensor compiler 之间的 tiny tensor runtime。**
+
+这个方向我认为比继续堆一百个 NumPy API 更有技术辨识度。
+
+---
+
+# 16. 如果现在让我给三个方案做工程评分
+
+不是绝对 benchmark 分，而是“在各自目标上的完成度”：
+
+| 项目 | litenp | NumPy | PyTorch |
+|---|---:|---:|---:|
+| 轻量部署 | **9.5** | 5 | 2 |
+| C++ 集成便利 | **9** | 3 | 6 |
+| 小数组调用 overhead | **9** | 6 | 5 |
+| 特殊结构优化 | **9.5** | 5 | 7* |
+| 普通 CPU elementwise | 8 | **9.5** | 9 |
+| GEMM | 6.5 | **9.5** | **9.5** |
+| API 广度 | 4 | **10** | **10** |
+| NumPy 语义兼容 | 4–5 | **10** | 8 |
+| dtype 完整度 | 4 | **10** | **10** |
+| GPU | 0 | 0¹ | **10** |
+| ML | 1 | 3 | **10** |
+| 成熟度 | 3 | **10** | **10** |
+| 社区 | 1 | **10** | **10** |
+| correctness 信心 | 5 | **10** | **9.5** |
+| 可控性/可读源码 | **9** | 5 | 2 |
+
+\* PyTorch compiler 也能进行大量 algebraic / graph optimization，但路线和 litenp 不完全一样。  
+¹ 指 NumPy core 本身，而不是 CuPy/JAX 等兼容生态。
+
+---
+
+# 17. 我对 README benchmark 的可信度分级
+
+这个可能是最实用的结论。
+
+| Benchmark 类型 | 我给的可信度 | 原因 |
+|---|---:|---|
+| ones/full/eye | ★★★★★ | 数字真实，但测的是 lazy semantics |
+| uniform sum | ★★★★★ | 合法 algebra shortcut |
+| uniform matmul | ★★★★★ | 合法 shortcut，但**不是 GEMM 性能** |
+| add uniform | ★★☆☆☆ | 被放进 dense 分类，但仍吃 uniform metadata |
+| greater uniform | ★★☆☆☆ | 同样有结构特例 |
+| concatenate uniform | ★★☆☆☆ | two-block virtual representation，不是 memcpy throughput |
+| relu patterned | ★★★★☆ | 比较有代表性 |
+| sqrt patterned | ★★★★☆ | 比较有代表性 |
+| exp patterned | ★★★★☆ | 比较有代表性 |
+| clip patterned | ★★★★☆ | 比较有代表性 |
+| NumPy metadata ops | ★★★☆☆ | 混入 Python call overhead |
+| Torch `add` | ★★☆☆☆ | allocation contract 不完全一致 |
+| generic random GEMM | **暂无充分证据** | 官方也承认 benchmark 缺失 |
+
+所以 README 中最应该避免的错误阅读是：
+
+> **“litenp 普遍比 NumPy 快 2–10×，某些地方快几千倍。”**
+
+我认为目前证据支持的是：
+
+> **“litenp 的结构感知路径可以快几个数量级；一些精心优化的单线程 float32 CPU kernel 比当前测试中的 NumPy/LibTorch 路径快约 2–4×；但尚不足以证明普通 dense ndarray workload 的普遍领先。”**
+
+而且它公开的 snapshot 是 **2026-05-27**，现在已经是 2026-10，NumPy 当前为 2.5.3、PyTorch 为 2.14，所以原始倍率也不能视为对当前版本的实时排名。[GitHub](https://github.com/a554142589/litenp)
+
+---
+
+# 18. 最终选择建议
+
+我的建议可以非常明确：
+
+- **Python 数值算法/研究/数据处理：选 NumPy。**
+- **深度学习/GPU/autograd：选 PyTorch。**
+- **纯 C++ CPU 产品，想去 Python、去 LibTorch、去重依赖，而且 ndarray 运算范围可控：litenp 值得认真考虑。**
+- **直接把现有大量 NumPy 代码迁移到 litenp：现在不建议。**
+- **把 litenp 当 production 基础数值库：需要先加一层你自己的 differential test。**
+- **把 litenp 当轻量图像算法/CV 前后处理 runtime：这是目前最匹配它的场景之一。**
+- **把 README benchmark 当“litenp 比 NumPy/Torch 快 X 倍”的证明：不建议。**
+
+我给它目前的技术定位大约是：
+
+> **“很有潜力的 specialized C++ tensor/ndarray runtime，性能工程能力明显超过普通个人 toy library，但 correctness、benchmark fairness、API semantics、生态成熟度距离 NumPy/PyTorch 仍有数量级差距。”**
+
+而它最值得继续押注的核心并不是再复制 `np.xxx`，而是 **structure-aware computation**。这一点如果继续做深，反而有可能成为一个 NumPy/PyTorch 本身并不擅长解决的独特方向。
+
+[litenp GitHub 仓库](https://github.com/a554142589/litenp)
