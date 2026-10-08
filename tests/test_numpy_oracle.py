@@ -176,6 +176,34 @@ int main() {
     emit("astype_i32", astype<std::int32_t>(a));
     emit("astype_f64", astype<double>(a));
 
+    // ---- broadcast_to (multi-dimensional) ----
+    auto bt2d = Array<float>::from_vector({2, 1}, {1.0f, 4.0f});
+    emit("broadcast_to_2x1_2x3", broadcast_to<float>(bt2d.view(), {2, 3}));
+    auto bt1d = Array<float>::from_vector({3}, {10.0f, 20.0f, 30.0f});
+    emit("broadcast_to_1x3_2x3", broadcast_to<float>(bt1d.view(), {2, 3}));
+    auto bt3d = Array<float>::from_vector({1, 2, 1}, {1.0f, 2.0f});
+    emit("broadcast_to_1x2x1_3x2x4", broadcast_to<float>(bt3d.view(), {3, 2, 4}));
+
+    // ---- cumsum ----
+    auto cs1d = Array<float>::from_vector({5}, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
+    emit("cumsum_1d", cumsum<float>(cs1d.view(), 0));
+    emit("cumsum_2d_axis0", cumsum<float>(a.view(), 0));
+    emit("cumsum_2d_axis1", cumsum<float>(a.view(), 1));
+
+    // ---- NaN propagation: minimum/maximum ----
+    auto nm1 = Array<float>::from_vector({4}, {nan, 1.0f, nan, 2.0f});
+    auto nm2 = Array<float>::from_vector({4}, {0.0f, 1.0f, nan, nan});
+    emit("nan_minimum", minimum<float>(nm1.view(), nm2.view()));
+    emit("nan_maximum", maximum<float>(nm1.view(), nm2.view()));
+
+    // ---- NaN propagation: min/max reduction ----
+    auto nan_arr = Array<float>::from_vector({4}, {3.0f, nan, 1.0f, 2.0f});
+    emit_scalar("nan_min", min<float>(nan_arr.view()));
+    emit_scalar("nan_max", max<float>(nan_arr.view()));
+    auto nan_2d = Array<float>::from_vector({2, 3}, {1.0f, nan, 3.0f, 4.0f, 5.0f, 6.0f});
+    emit("nan_min_axis0", min<float>(nan_2d.view(), 0));
+    emit("nan_max_axis1", max<float>(nan_2d.view(), 1));
+
     return 0;
 }
 """
@@ -205,11 +233,27 @@ def check_close(rows: dict[str, list[float]], name: str, expected: np.ndarray,
         raise AssertionError(f"{name}: shape {got.shape} vs {exp.shape}\n  got {got}\n  exp {exp}")
 
 
+def check_close_nan(rows: dict[str, list[float]], name: str, expected: np.ndarray,
+                    atol: float = 1e-5, rtol: float = 1e-5) -> None:
+    """Like check_close but treats NaN==NaN as equal (for NaN propagation tests)."""
+    got = get_array(rows, name)
+    exp = np.asarray(expected, dtype=np.float64)
+    if got.shape != exp.shape or not np.allclose(got, exp, atol=atol, rtol=rtol, equal_nan=True):
+        raise AssertionError(f"{name}: shape {got.shape} vs {exp.shape}\n  got {got}\n  exp {exp}")
+
+
 def check_scalar(rows: dict[str, list[float]], name: str, expected: float,
                  atol: float = 1e-5) -> None:
     got = rows[f"{name}_scalar"][0]
     if abs(got - expected) > atol:
         raise AssertionError(f"{name}: got {got}, expected {expected}")
+
+
+def check_scalar_nan(rows: dict[str, list[float]], name: str) -> None:
+    """Check that a scalar result is NaN."""
+    got = rows[f"{name}_scalar"][0]
+    if not np.isnan(got):
+        raise AssertionError(f"{name}: expected NaN, got {got}")
 
 
 def check_mask(rows: dict[str, list[float]], name: str, expected: np.ndarray) -> None:
@@ -336,6 +380,34 @@ def main() -> None:
     # astype
     check_close(rows, "astype_i32", a.astype(np.int32))
     check_close(rows, "astype_f64", a.astype(np.float64))
+
+    # broadcast_to (multi-dimensional)
+    bt2d = np.array([[1.0], [4.0]], dtype=np.float32)
+    check_close(rows, "broadcast_to_2x1_2x3", np.broadcast_to(bt2d, (2, 3)))
+    bt1d = np.array([10.0, 20.0, 30.0], dtype=np.float32)
+    check_close(rows, "broadcast_to_1x3_2x3", np.broadcast_to(bt1d, (2, 3)))
+    bt3d = np.array([[[1.0], [2.0]]], dtype=np.float32)
+    check_close(rows, "broadcast_to_1x2x1_3x2x4", np.broadcast_to(bt3d, (3, 2, 4)))
+
+    # cumsum
+    cs1d = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+    check_close(rows, "cumsum_1d", np.cumsum(cs1d, axis=0))
+    check_close(rows, "cumsum_2d_axis0", np.cumsum(a, axis=0))
+    check_close(rows, "cumsum_2d_axis1", np.cumsum(a, axis=1))
+
+    # NaN propagation: minimum/maximum
+    nm1 = np.array([np.nan, 1.0, np.nan, 2.0], dtype=np.float32)
+    nm2 = np.array([0.0, 1.0, np.nan, np.nan], dtype=np.float32)
+    check_close_nan(rows, "nan_minimum", np.minimum(nm1, nm2))
+    check_close_nan(rows, "nan_maximum", np.maximum(nm1, nm2))
+
+    # NaN propagation: min/max reduction
+    nan_arr = np.array([3.0, np.nan, 1.0, 2.0], dtype=np.float32)
+    check_scalar_nan(rows, "nan_min")
+    check_scalar_nan(rows, "nan_max")
+    nan_2d = np.array([[1.0, np.nan, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+    check_close_nan(rows, "nan_min_axis0", np.min(nan_2d, axis=0))
+    check_close_nan(rows, "nan_max_axis1", np.max(nan_2d, axis=1))
 
     print(f"numpy oracle passed ({len([k for k in rows if not k.endswith('_shape') and not k.endswith('_scalar')])} array + scalar checks)")
 

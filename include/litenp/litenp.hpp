@@ -492,6 +492,63 @@ enum class UnaryOp {
     Radians
 };
 
+// NaN-propagating minimum/maximum (matches NumPy np.minimum/np.maximum semantics)
+template <typename T>
+inline T nan_minimum(T a, T b) {
+    if constexpr (std::is_floating_point<T>::value) {
+        if (a != a || b != b) return std::numeric_limits<T>::quiet_NaN();
+    }
+    return b < a ? b : a;
+}
+
+template <typename T>
+inline T nan_maximum(T a, T b) {
+    if constexpr (std::is_floating_point<T>::value) {
+        if (a != a || b != b) return std::numeric_limits<T>::quiet_NaN();
+    }
+    return a < b ? b : a;
+}
+
+#if defined(__AVX2__)
+static inline __m256 nan_min_ps(__m256 a, __m256 b) {
+    __m256 result = _mm256_min_ps(a, b);
+    __m256 nan_mask = _mm256_or_ps(_mm256_cmp_ps(a, a, _CMP_UNORD_Q), _mm256_cmp_ps(b, b, _CMP_UNORD_Q));
+    return _mm256_or_ps(result, nan_mask);
+}
+
+static inline __m256 nan_max_ps(__m256 a, __m256 b) {
+    __m256 result = _mm256_max_ps(a, b);
+    __m256 nan_mask = _mm256_or_ps(_mm256_cmp_ps(a, a, _CMP_UNORD_Q), _mm256_cmp_ps(b, b, _CMP_UNORD_Q));
+    return _mm256_or_ps(result, nan_mask);
+}
+
+static inline __m256d nan_min_pd(__m256d a, __m256d b) {
+    __m256d result = _mm256_min_pd(a, b);
+    __m256d nan_mask = _mm256_or_pd(_mm256_cmp_pd(a, a, _CMP_UNORD_Q), _mm256_cmp_pd(b, b, _CMP_UNORD_Q));
+    return _mm256_or_pd(result, nan_mask);
+}
+
+static inline __m256d nan_max_pd(__m256d a, __m256d b) {
+    __m256d result = _mm256_max_pd(a, b);
+    __m256d nan_mask = _mm256_or_pd(_mm256_cmp_pd(a, a, _CMP_UNORD_Q), _mm256_cmp_pd(b, b, _CMP_UNORD_Q));
+    return _mm256_or_pd(result, nan_mask);
+}
+#endif
+
+#if defined(__AVX512F__)
+static inline __m512 nan_min_ps512(__m512 a, __m512 b) {
+    __m512 result = _mm512_min_ps(a, b);
+    __mmask16 nan_mask = _mm512_cmp_ps_mask(a, a, _CMP_UNORD_Q) | _mm512_cmp_ps_mask(b, b, _CMP_UNORD_Q);
+    return _mm512_mask_blend_ps(nan_mask, result, _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN()));
+}
+
+static inline __m512 nan_max_ps512(__m512 a, __m512 b) {
+    __m512 result = _mm512_max_ps(a, b);
+    __mmask16 nan_mask = _mm512_cmp_ps_mask(a, a, _CMP_UNORD_Q) | _mm512_cmp_ps_mask(b, b, _CMP_UNORD_Q);
+    return _mm512_mask_blend_ps(nan_mask, result, _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN()));
+}
+#endif
+
 template <typename T>
 inline T apply_binary(T a, T b, BinaryOp op) {
     switch (op) {
@@ -504,9 +561,9 @@ inline T apply_binary(T a, T b, BinaryOp op) {
         case BinaryOp::Div:
             return a / b;
         case BinaryOp::Min:
-            return std::min(a, b);
+            return nan_minimum(a, b);
         case BinaryOp::Max:
-            return std::max(a, b);
+            return nan_maximum(a, b);
         case BinaryOp::Pow:
             return static_cast<T>(std::pow(static_cast<double>(a), static_cast<double>(b)));
         case BinaryOp::Mod:
@@ -1268,10 +1325,10 @@ inline void binary_contiguous(const T* a, const T* b, T* out, std::size_t n, Bin
                 run([](__m256 x, __m256 y) { return _mm256_div_ps(x, y); }, [](float x, float y) { return x / y; });
                 return;
             case BinaryOp::Min:
-                run([](__m256 x, __m256 y) { return _mm256_min_ps(x, y); }, [](float x, float y) { return std::min(x, y); });
+                run([](__m256 x, __m256 y) { return nan_min_ps(x, y); }, [](float x, float y) { return nan_minimum(x, y); });
                 return;
             case BinaryOp::Max:
-                run([](__m256 x, __m256 y) { return _mm256_max_ps(x, y); }, [](float x, float y) { return std::max(x, y); });
+                run([](__m256 x, __m256 y) { return nan_max_ps(x, y); }, [](float x, float y) { return nan_maximum(x, y); });
                 return;
         }
         return;
@@ -1296,10 +1353,10 @@ inline void binary_contiguous(const T* a, const T* b, T* out, std::size_t n, Bin
                     vr = _mm256_div_pd(va, vb);
                     break;
                 case BinaryOp::Min:
-                    vr = _mm256_min_pd(va, vb);
+                    vr = nan_min_pd(va, vb);
                     break;
                 case BinaryOp::Max:
-                    vr = _mm256_max_pd(va, vb);
+                    vr = nan_max_pd(va, vb);
                     break;
             }
             _mm256_storeu_pd(out + i, vr);
@@ -1390,10 +1447,10 @@ inline void binary_scalar_contiguous(const T* a, T b, T* out, std::size_t n, Bin
                 run([](__m256 x, __m256 y) { return _mm256_div_ps(x, y); }, [](float x, float y) { return x / y; });
                 return;
             case BinaryOp::Min:
-                run([](__m256 x, __m256 y) { return _mm256_min_ps(x, y); }, [](float x, float y) { return std::min(x, y); });
+                run([](__m256 x, __m256 y) { return nan_min_ps(x, y); }, [](float x, float y) { return nan_minimum(x, y); });
                 return;
             case BinaryOp::Max:
-                run([](__m256 x, __m256 y) { return _mm256_max_ps(x, y); }, [](float x, float y) { return std::max(x, y); });
+                run([](__m256 x, __m256 y) { return nan_max_ps(x, y); }, [](float x, float y) { return nan_maximum(x, y); });
                 return;
         }
         return;
@@ -1447,10 +1504,10 @@ inline void binary_scalar_contiguous(const T* a, T b, T* out, std::size_t n, Bin
                 run([](__m256d x, __m256d y) { return _mm256_div_pd(x, y); }, [](double x, double y) { return x / y; });
                 return;
             case BinaryOp::Min:
-                run([](__m256d x, __m256d y) { return _mm256_min_pd(x, y); }, [](double x, double y) { return std::min(x, y); });
+                run([](__m256d x, __m256d y) { return nan_min_pd(x, y); }, [](double x, double y) { return nan_minimum(x, y); });
                 return;
             case BinaryOp::Max:
-                run([](__m256d x, __m256d y) { return _mm256_max_pd(x, y); }, [](double x, double y) { return std::max(x, y); });
+                run([](__m256d x, __m256d y) { return nan_max_pd(x, y); }, [](double x, double y) { return nan_maximum(x, y); });
                 return;
         }
         return;
@@ -2225,7 +2282,7 @@ inline void binary_mixed_contiguous(const A* a, const B* b, R* out, std::size_t 
 #pragma omp parallel for if (detail::use_openmp_for(n))
 #endif
             for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-                out[i] = std::min(static_cast<R>(a[i]), static_cast<R>(b[i]));
+                out[i] = nan_minimum(static_cast<R>(a[i]), static_cast<R>(b[i]));
             }
             return;
         case BinaryOp::Max:
@@ -2233,7 +2290,7 @@ inline void binary_mixed_contiguous(const A* a, const B* b, R* out, std::size_t 
 #pragma omp parallel for if (detail::use_openmp_for(n))
 #endif
             for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-                out[i] = std::max(static_cast<R>(a[i]), static_cast<R>(b[i]));
+                out[i] = nan_maximum(static_cast<R>(a[i]), static_cast<R>(b[i]));
             }
             return;
     }
@@ -2280,7 +2337,7 @@ inline void binary_mixed_scalar_right_contiguous(const A* a, B b, R* out, std::s
 #pragma omp parallel for if (detail::use_openmp_for(n))
 #endif
             for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-                out[i] = std::min(static_cast<R>(a[i]), rb);
+                out[i] = nan_minimum(static_cast<R>(a[i]), rb);
             }
             return;
         case BinaryOp::Max:
@@ -2288,7 +2345,7 @@ inline void binary_mixed_scalar_right_contiguous(const A* a, B b, R* out, std::s
 #pragma omp parallel for if (detail::use_openmp_for(n))
 #endif
             for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-                out[i] = std::max(static_cast<R>(a[i]), rb);
+                out[i] = nan_maximum(static_cast<R>(a[i]), rb);
             }
             return;
     }
@@ -2335,7 +2392,7 @@ inline void binary_mixed_scalar_left_contiguous(A a, const B* b, R* out, std::si
 #pragma omp parallel for if (detail::use_openmp_for(n))
 #endif
             for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-                out[i] = std::min(ra, static_cast<R>(b[i]));
+                out[i] = nan_minimum(ra, static_cast<R>(b[i]));
             }
             return;
         case BinaryOp::Max:
@@ -2343,7 +2400,7 @@ inline void binary_mixed_scalar_left_contiguous(A a, const B* b, R* out, std::si
 #pragma omp parallel for if (detail::use_openmp_for(n))
 #endif
             for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-                out[i] = std::max(ra, static_cast<R>(b[i]));
+                out[i] = nan_maximum(ra, static_cast<R>(b[i]));
             }
             return;
     }
@@ -3289,7 +3346,7 @@ template <typename T>
 inline T max_contiguous_scalar(const T* data, std::size_t n) {
     T best = data[0];
     for (std::size_t i = 1; i < n; ++i) {
-        best = std::max(best, data[i]);
+        best = nan_maximum(best, data[i]);
     }
     return best;
 }
@@ -3310,29 +3367,29 @@ inline T max_contiguous(const T* data, std::size_t n) {
             __m256 acc6 = _mm256_loadu_ps(data + 48);
             __m256 acc7 = _mm256_loadu_ps(data + 56);
             for (; i + 64 <= n; i += 64) {
-                acc0 = _mm256_max_ps(acc0, _mm256_loadu_ps(data + i));
-                acc1 = _mm256_max_ps(acc1, _mm256_loadu_ps(data + i + 8));
-                acc2 = _mm256_max_ps(acc2, _mm256_loadu_ps(data + i + 16));
-                acc3 = _mm256_max_ps(acc3, _mm256_loadu_ps(data + i + 24));
-                acc4 = _mm256_max_ps(acc4, _mm256_loadu_ps(data + i + 32));
-                acc5 = _mm256_max_ps(acc5, _mm256_loadu_ps(data + i + 40));
-                acc6 = _mm256_max_ps(acc6, _mm256_loadu_ps(data + i + 48));
-                acc7 = _mm256_max_ps(acc7, _mm256_loadu_ps(data + i + 56));
+                acc0 = nan_max_ps(acc0, _mm256_loadu_ps(data + i));
+                acc1 = nan_max_ps(acc1, _mm256_loadu_ps(data + i + 8));
+                acc2 = nan_max_ps(acc2, _mm256_loadu_ps(data + i + 16));
+                acc3 = nan_max_ps(acc3, _mm256_loadu_ps(data + i + 24));
+                acc4 = nan_max_ps(acc4, _mm256_loadu_ps(data + i + 32));
+                acc5 = nan_max_ps(acc5, _mm256_loadu_ps(data + i + 40));
+                acc6 = nan_max_ps(acc6, _mm256_loadu_ps(data + i + 48));
+                acc7 = nan_max_ps(acc7, _mm256_loadu_ps(data + i + 56));
             }
-            __m256 best = _mm256_max_ps(
-                _mm256_max_ps(_mm256_max_ps(acc0, acc1), _mm256_max_ps(acc2, acc3)),
-                _mm256_max_ps(_mm256_max_ps(acc4, acc5), _mm256_max_ps(acc6, acc7)));
+            __m256 best = nan_max_ps(
+                nan_max_ps(nan_max_ps(acc0, acc1), nan_max_ps(acc2, acc3)),
+                nan_max_ps(nan_max_ps(acc4, acc5), nan_max_ps(acc6, acc7)));
             for (; i + 8 <= n; i += 8) {
-                best = _mm256_max_ps(best, _mm256_loadu_ps(data + i));
+                best = nan_max_ps(best, _mm256_loadu_ps(data + i));
             }
             alignas(32) float lanes[8];
             _mm256_store_ps(lanes, best);
             float scalar_best = lanes[0];
             for (std::size_t lane = 1; lane < 8; ++lane) {
-                scalar_best = std::max(scalar_best, lanes[lane]);
+                scalar_best = nan_maximum(scalar_best, lanes[lane]);
             }
             for (; i < n; ++i) {
-                scalar_best = std::max(scalar_best, data[i]);
+                scalar_best = nan_maximum(scalar_best, data[i]);
             }
             return scalar_best;
         }
@@ -3343,23 +3400,23 @@ inline T max_contiguous(const T* data, std::size_t n) {
             __m256 acc2 = _mm256_loadu_ps(data + 16);
             __m256 acc3 = _mm256_loadu_ps(data + 24);
             for (; i + 32 <= n; i += 32) {
-                acc0 = _mm256_max_ps(acc0, _mm256_loadu_ps(data + i));
-                acc1 = _mm256_max_ps(acc1, _mm256_loadu_ps(data + i + 8));
-                acc2 = _mm256_max_ps(acc2, _mm256_loadu_ps(data + i + 16));
-                acc3 = _mm256_max_ps(acc3, _mm256_loadu_ps(data + i + 24));
+                acc0 = nan_max_ps(acc0, _mm256_loadu_ps(data + i));
+                acc1 = nan_max_ps(acc1, _mm256_loadu_ps(data + i + 8));
+                acc2 = nan_max_ps(acc2, _mm256_loadu_ps(data + i + 16));
+                acc3 = nan_max_ps(acc3, _mm256_loadu_ps(data + i + 24));
             }
-            __m256 best = _mm256_max_ps(_mm256_max_ps(acc0, acc1), _mm256_max_ps(acc2, acc3));
+            __m256 best = nan_max_ps(nan_max_ps(acc0, acc1), nan_max_ps(acc2, acc3));
             for (; i + 8 <= n; i += 8) {
-                best = _mm256_max_ps(best, _mm256_loadu_ps(data + i));
+                best = nan_max_ps(best, _mm256_loadu_ps(data + i));
             }
             alignas(32) float lanes[8];
             _mm256_store_ps(lanes, best);
             float scalar_best = lanes[0];
             for (std::size_t lane = 1; lane < 8; ++lane) {
-                scalar_best = std::max(scalar_best, lanes[lane]);
+                scalar_best = nan_maximum(scalar_best, lanes[lane]);
             }
             for (; i < n; ++i) {
-                scalar_best = std::max(scalar_best, data[i]);
+                scalar_best = nan_maximum(scalar_best, data[i]);
             }
             return scalar_best;
         }
@@ -3367,16 +3424,16 @@ inline T max_contiguous(const T* data, std::size_t n) {
             std::size_t i = 8;
             __m256 best = _mm256_loadu_ps(data);
             for (; i + 8 <= n; i += 8) {
-                best = _mm256_max_ps(best, _mm256_loadu_ps(data + i));
+                best = nan_max_ps(best, _mm256_loadu_ps(data + i));
             }
             alignas(32) float lanes[8];
             _mm256_store_ps(lanes, best);
             float scalar_best = lanes[0];
             for (std::size_t lane = 1; lane < 8; ++lane) {
-                scalar_best = std::max(scalar_best, lanes[lane]);
+                scalar_best = nan_maximum(scalar_best, lanes[lane]);
             }
             for (; i < n; ++i) {
-                scalar_best = std::max(scalar_best, data[i]);
+                scalar_best = nan_maximum(scalar_best, data[i]);
             }
             return scalar_best;
         }
@@ -3389,23 +3446,23 @@ inline T max_contiguous(const T* data, std::size_t n) {
             __m256d acc2 = _mm256_loadu_pd(data + 8);
             __m256d acc3 = _mm256_loadu_pd(data + 12);
             for (; i + 16 <= n; i += 16) {
-                acc0 = _mm256_max_pd(acc0, _mm256_loadu_pd(data + i));
-                acc1 = _mm256_max_pd(acc1, _mm256_loadu_pd(data + i + 4));
-                acc2 = _mm256_max_pd(acc2, _mm256_loadu_pd(data + i + 8));
-                acc3 = _mm256_max_pd(acc3, _mm256_loadu_pd(data + i + 12));
+                acc0 = nan_max_pd(acc0, _mm256_loadu_pd(data + i));
+                acc1 = nan_max_pd(acc1, _mm256_loadu_pd(data + i + 4));
+                acc2 = nan_max_pd(acc2, _mm256_loadu_pd(data + i + 8));
+                acc3 = nan_max_pd(acc3, _mm256_loadu_pd(data + i + 12));
             }
-            __m256d best = _mm256_max_pd(_mm256_max_pd(acc0, acc1), _mm256_max_pd(acc2, acc3));
+            __m256d best = nan_max_pd(nan_max_pd(acc0, acc1), nan_max_pd(acc2, acc3));
             for (; i + 4 <= n; i += 4) {
-                best = _mm256_max_pd(best, _mm256_loadu_pd(data + i));
+                best = nan_max_pd(best, _mm256_loadu_pd(data + i));
             }
             alignas(32) double lanes[4];
             _mm256_store_pd(lanes, best);
             double scalar_best = lanes[0];
             for (std::size_t lane = 1; lane < 4; ++lane) {
-                scalar_best = std::max(scalar_best, lanes[lane]);
+                scalar_best = nan_maximum(scalar_best, lanes[lane]);
             }
             for (; i < n; ++i) {
-                scalar_best = std::max(scalar_best, data[i]);
+                scalar_best = nan_maximum(scalar_best, data[i]);
             }
             return scalar_best;
         }
@@ -3413,16 +3470,16 @@ inline T max_contiguous(const T* data, std::size_t n) {
             std::size_t i = 4;
             __m256d best = _mm256_loadu_pd(data);
             for (; i + 4 <= n; i += 4) {
-                best = _mm256_max_pd(best, _mm256_loadu_pd(data + i));
+                best = nan_max_pd(best, _mm256_loadu_pd(data + i));
             }
             alignas(32) double lanes[4];
             _mm256_store_pd(lanes, best);
             double scalar_best = lanes[0];
             for (std::size_t lane = 1; lane < 4; ++lane) {
-                scalar_best = std::max(scalar_best, lanes[lane]);
+                scalar_best = nan_maximum(scalar_best, lanes[lane]);
             }
             for (; i < n; ++i) {
-                scalar_best = std::max(scalar_best, data[i]);
+                scalar_best = nan_maximum(scalar_best, data[i]);
             }
             return scalar_best;
         }
@@ -4114,6 +4171,9 @@ inline GemmBackend select_gemm_backend(std::size_t m, std::size_t k, std::size_t
 }
 
 }  // namespace detail
+
+using detail::nan_minimum;
+using detail::nan_maximum;
 
 inline std::size_t numel(const Shape& shape) {
     return detail::checked_product(shape);
@@ -6660,11 +6720,11 @@ T max(ArrayView<const T> a) {
                 T local = best;
 #pragma omp for nowait
                 for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(a.size()); ++i) {
-                    local = std::max(local, a.data()[i]);
+                    local = nan_maximum(local, a.data()[i]);
                 }
 #pragma omp critical
                 {
-                    best = std::max(best, local);
+                    best = nan_maximum(best, local);
                 }
             }
             return best;
@@ -6677,7 +6737,7 @@ T max(ArrayView<const T> a) {
     T best = a.data()[detail::offset_for_index(index, a.strides())];
     for (std::size_t i = 1; i < a.size(); ++i) {
         detail::linear_to_index(i, a.shape(), index);
-        best = std::max(best, a.data()[detail::offset_for_index(index, a.strides())]);
+        best = nan_maximum(best, a.data()[detail::offset_for_index(index, a.strides())]);
     }
     return best;
 }
@@ -6824,7 +6884,7 @@ Array<T> max(ArrayView<const T> a, std::size_t axis) {
             for (std::size_t r = 1; r < rows; ++r) {
                 const T* row = a.data() + r * cols;
                 for (std::size_t c = 0; c < cols; ++c) {
-                    out[c] = std::max(out[c], row[c]);
+                    out[c] = nan_maximum(out[c], row[c]);
                 }
             }
             return out;
@@ -6845,7 +6905,7 @@ Array<T> max(ArrayView<const T> a, std::size_t axis) {
         T best = a.data()[detail::offset_for_index(in_index, a.strides())];
         for (std::size_t k = 1; k < a.shape()[axis]; ++k) {
             in_index[axis] = k;
-            best = std::max(best, a.data()[detail::offset_for_index(in_index, a.strides())]);
+            best = nan_maximum(best, a.data()[detail::offset_for_index(in_index, a.strides())]);
         }
         out[out_linear] = best;
     }
@@ -6874,18 +6934,18 @@ T min(ArrayView<const T> a) {
                 std::size_t i = 0;
                 __m512 best = _mm512_loadu_ps(d);
                 const std::size_t vec_end = n - n % 16;
-                for (i = 16; i < vec_end; i += 16) best = _mm512_min_ps(best, _mm512_loadu_ps(d + i));
+                for (i = 16; i < vec_end; i += 16) best = nan_min_ps512(best, _mm512_loadu_ps(d + i));
                 T tmp[16];
                 _mm512_storeu_ps(tmp, best);
                 T scalar = tmp[0];
-                for (int k = 1; k < 16; ++k) scalar = std::min(scalar, tmp[k]);
-                for (; i < n; ++i) scalar = std::min(scalar, d[i]);
+                for (int k = 1; k < 16; ++k) scalar = nan_minimum(scalar, tmp[k]);
+                for (; i < n; ++i) scalar = nan_minimum(scalar, d[i]);
                 return scalar;
             }
         }
 #endif
         T best = d[0];
-        for (std::size_t i = 1; i < n; ++i) best = std::min(best, d[i]);
+        for (std::size_t i = 1; i < n; ++i) best = nan_minimum(best, d[i]);
         return best;
     }
     Shape index;
@@ -6893,7 +6953,7 @@ T min(ArrayView<const T> a) {
     T best = a.data()[detail::offset_for_index(index, a.strides())];
     for (std::size_t i = 1; i < a.size(); ++i) {
         detail::linear_to_index(i, a.shape(), index);
-        best = std::min(best, a.data()[detail::offset_for_index(index, a.strides())]);
+        best = nan_minimum(best, a.data()[detail::offset_for_index(index, a.strides())]);
     }
     return best;
 }
@@ -6917,7 +6977,7 @@ Array<T> min(ArrayView<const T> a, std::size_t axis) {
             for (std::size_t r = 0; r < rows; ++r) {
                 const T* row = a.data() + r * cols;
                 T best = row[0];
-                for (std::size_t c = 1; c < cols; ++c) best = std::min(best, row[c]);
+                for (std::size_t c = 1; c < cols; ++c) best = nan_minimum(best, row[c]);
                 out[r] = best;
             }
             return out;
@@ -6926,7 +6986,7 @@ Array<T> min(ArrayView<const T> a, std::size_t axis) {
             std::copy(a.data(), a.data() + cols, out.data());
             for (std::size_t r = 1; r < rows; ++r) {
                 const T* row = a.data() + r * cols;
-                for (std::size_t c = 0; c < cols; ++c) out[c] = std::min(out[c], row[c]);
+                for (std::size_t c = 0; c < cols; ++c) out[c] = nan_minimum(out[c], row[c]);
             }
             return out;
         }
@@ -6943,7 +7003,7 @@ Array<T> min(ArrayView<const T> a, std::size_t axis) {
         T best = a.data()[detail::offset_for_index(in_index, a.strides())];
         for (std::size_t k = 1; k < a.shape()[axis]; ++k) {
             in_index[axis] = k;
-            best = std::min(best, a.data()[detail::offset_for_index(in_index, a.strides())]);
+            best = nan_minimum(best, a.data()[detail::offset_for_index(in_index, a.strides())]);
         }
         out[out_linear] = best;
     }
@@ -7254,20 +7314,60 @@ template <typename T>
 Array<T> cumsum(ArrayView<const T> a, std::size_t axis) {
     detail::require(axis < a.ndim(), "axis out of range");
     Array<T> out = detail::make_uninitialized_array<T>(a.shape());
-    const std::size_t axis_len = a.shape()[axis];
-    Shape out_index;
-    Shape in_index(a.ndim(), 0);
-    for (std::size_t out_linear = 0; out_linear < out.size(); ++out_linear) {
-        detail::linear_to_index(out_linear, out.shape(), out_index);
-        for (std::size_t d = 0; d < a.ndim(); ++d) {
-            in_index[d] = out_index[d];
-        }
+    const Shape& shape = a.shape();
+    const std::size_t ndim = shape.size();
+    const std::size_t axis_len = shape[axis];
+
+    // 1D contiguous fast path
+    if (a.is_contiguous() && ndim == 1) {
+        const T* d = a.data();
+        T* o = out.data();
         T acc = T{};
-        for (std::size_t k = 0; k <= out_index[axis]; ++k) {
-            in_index[axis] = k;
-            acc += a.data()[detail::offset_for_index(in_index, a.strides())];
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            acc += d[i];
+            o[i] = acc;
         }
-        out[out_linear] = acc;
+        return out;
+    }
+
+    // Contiguous N-D fast path: O(N) using outer/inner/axis decomposition
+    if (a.is_contiguous()) {
+        std::size_t outer_size = 1;
+        for (std::size_t d = 0; d < axis; ++d) outer_size *= shape[d];
+        std::size_t inner_size = 1;
+        for (std::size_t d = axis + 1; d < ndim; ++d) inner_size *= shape[d];
+
+        const T* d = a.data();
+        T* o = out.data();
+        for (std::size_t outer = 0; outer < outer_size; ++outer) {
+            for (std::size_t inner = 0; inner < inner_size; ++inner) {
+                T acc = T{};
+                for (std::size_t k = 0; k < axis_len; ++k) {
+                    std::size_t idx = (outer * axis_len + k) * inner_size + inner;
+                    acc += d[idx];
+                    o[idx] = acc;
+                }
+            }
+        }
+        return out;
+    }
+
+    // Non-contiguous fallback: O(N) using output as running sum
+    std::size_t axis_stride = 1;
+    for (std::size_t d = ndim - 1; d > axis; --d) {
+        axis_stride *= shape[d];
+    }
+    Shape out_index;
+    Shape in_index(ndim, 0);
+    for (std::size_t linear = 0; linear < out.size(); ++linear) {
+        detail::linear_to_index(linear, out.shape(), out_index);
+        for (std::size_t d = 0; d < ndim; ++d) in_index[d] = out_index[d];
+        T val = a.data()[detail::offset_for_index(in_index, a.strides())];
+        if (out_index[axis] == 0) {
+            out[linear] = val;
+        } else {
+            out[linear] = val + out[linear - axis_stride];
+        }
     }
     return out;
 }
@@ -7433,11 +7533,24 @@ template <typename T> Array<T> repeat(const Array<T>& a, std::size_t repeats) { 
 
 template <typename T>
 Array<T> broadcast_to(ArrayView<const T> a, const Shape& shape) {
+    // Validate broadcast compatibility
+    const std::size_t shift = shape.size() >= a.ndim() ? shape.size() - a.ndim() : 0;
+    for (std::size_t i = 0; i < a.ndim(); ++i) {
+        const std::size_t out_dim = shape[i + shift];
+        const std::size_t in_dim = a.shape()[i];
+        if (in_dim != 1 && in_dim != out_dim) {
+            throw std::invalid_argument("cannot broadcast to this shape");
+        }
+    }
     Array<T> out = detail::make_uninitialized_array<T>(shape);
     const T* d = a.data();
-    const std::size_t lead = a.size();
-    for (std::size_t i = 0; i < out.size(); ++i) {
-        out[i] = d[i % lead];
+    const Shape& in_shape = a.shape();
+    const Shape& in_strides = a.strides();
+    Shape out_index;
+    for (std::size_t linear = 0; linear < out.size(); ++linear) {
+        detail::linear_to_index(linear, shape, out_index);
+        const std::size_t offset = detail::broadcast_offset(out_index, shape, in_shape, in_strides);
+        out[linear] = d[offset];
     }
     return out;
 }
