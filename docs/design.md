@@ -16,6 +16,9 @@ The MVP contains:
 - Common construction helpers such as `zeros`, `ones`, `full`, `linspace`,
   and `eye`.
 - Shape utilities, contiguous strides, reshape, and slicing.
+- **Signed strides** (`Strides = std::vector<std::ptrdiff_t>`) so reverse
+  slices and negative-step traversal use well-defined C++ pointer
+  arithmetic instead of an unsigned two's-complement hack.
 - Step slicing (positive and negative; `litenp::SLICE_OPEN` sentinel for
   omitted `begin`/`end`, mirroring Python slice semantics) and `select`
   views without copies.
@@ -23,9 +26,14 @@ The MVP contains:
 - Shape helpers (`flatten`, `squeeze`, `unsqueeze`) and `astype`.
 - Elementwise arithmetic with broadcasting via a unified `BroadcastPlan`
   (output shape and per-operand strides precomputed once and reused by
-  binary ops, comparisons, and `where`).
+  binary ops, comparisons, and `where`). `broadcast_to` rejects
+  lower-rank targets.
 - Mixed dtype arithmetic via a NumPy-compatible `promote_type` (kind+bits
-  rule; e.g. `int32 + float -> double`), replacing `std::common_type_t`.
+  rule; e.g. `int32 + float -> double`, `int64 + uint64 -> double`,
+  `int32 + uint32 -> int64`), replacing `std::common_type_t`.
+- `true_divide` for integral operands promotes to `double` (NumPy
+  semantics); `divide` keeps C++ integer semantics for same-typed integral
+  arrays.
 - Common unary kernels for inference-style workloads.
 - Mask-style conditionals: comparisons, `where`, and `clip`.
 - Array combination with `concatenate` and `stack`.

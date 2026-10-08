@@ -69,7 +69,7 @@ void test_array_shape_and_view() {
     litenp::Array<float> a({2, 3});
     assert(reinterpret_cast<std::uintptr_t>(a.data()) % 32 == 0);
     assert(a.shape() == (litenp::Shape{2, 3}));
-    assert(a.strides() == (litenp::Shape{3, 1}));
+    assert(a.strides() == (litenp::Strides{3, 1}));
     expect_close(a({0, 0}), 0.0f);
     a.values()[0] = 2.0f;
     expect_close(a({0, 0}), 2.0f);

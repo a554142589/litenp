@@ -1,0 +1,1215 @@
+我重新按你指定的 **`trae/agent-Gu4z5u-fix` 分支**审了一轮。结论比我上一次对 `main` 的评价**明显上调**：
+
+> 这已经不只是“加了一些 NumPy API”，而是开始真正解决 **语义正确性、复杂度、测试体系和工程可信度**。  
+> 我上次指出的两个最明显问题——`cumsum O(N²)` 和错误的二维/多维 `broadcast_to`——基本都已经被实质性修掉了。
+
+但目前我仍然看到 **2 个 P0 级结构问题 + 2 个 P1 级问题**。这些处理完，我会认为它从“不错的个人项目”正式进入“可以认真拿来做 production CPU ndarray runtime”的阶段。
+
+---
+
+# 1. 这次优化我认可的部分
+
+## ① `cumsum`：这是一次真正的算法级修复
+
+上个版本最大的问题之一，是对每个输出位置重新从头累加，本质可能退化到：
+
+\[
+O(N^2)
+\]
+
+这个分支现在已经改成：
+
+- 1D contiguous：单次 prefix scan
+- N-D contiguous：outer / axis / inner decomposition
+- non-contiguous：利用上一输出作为 running sum
+
+源码也明确标成了 `O(N)`。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/include/litenp/litenp.hpp)
+
+核心结构现在相当于：
+
+```cpp
+for outer:
+    for inner:
+        acc = 0
+        for axis:
+            acc += input
+            output = acc
+```
+
+这是正确方向。
+
+### 评价
+
+**之前：4/10**  
+**现在：9/10**
+
+甚至从性能复杂度上讲，这是这轮最有价值的修改之一。
+
+例如 axis 长度为 2048 时，理论计算量从近似：
+
+\[
+1+2+\cdots+2048
+\]
+
+降到：
+
+\[
+2048
+\]
+
+约减少 **1000× 级别的累加次数**。
+
+当然实际 wall-clock 不会快 1000×，但这是“算法复杂度修复”，不是 10% 微优化。
+
+---
+
+# 2. `broadcast_to`：主要错误已经修掉了
+
+上次我指出：
+
+```cpp
+out[i] = d[i % input_size];
+```
+
+不是 NumPy broadcasting。
+
+现在已经真正按照：
+
+```text
+output index
+     ↓
+broadcast index mapping
+     ↓
+input strides
+```
+
+去计算。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/include/litenp/litenp.hpp)
+
+而且测试里已经加入：
+
+```text
+(2,1)   -> (2,3)
+(3)     -> (2,3)
+(1,2,1) -> (3,2,4)
+```
+
+这些正是很有代表性的 multidimensional broadcasting cases。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/tests/test_numpy_oracle.py)
+
+因此我上次举的：
+
+```text
+[[1],
+ [2]]
+```
+
+广播为 `(2,3)` 错成：
+
+```text
+1 2 1
+2 1 2
+```
+
+的问题已经解决。
+
+### 更重要的是
+
+你不只是修 `broadcast_to()`。
+
+现在内部已经抽象了：
+
+```cpp
+BroadcastPlan
+{
+    output_shape;
+    lhs_strides;
+    rhs_strides;
+}
+```
+
+而且广播维直接转换为 **zero stride**。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/include/litenp/litenp.hpp)
+
+这比给每一个 operator 单独打补丁好得多。
+
+以后：
+
+```text
+add
+sub
+mul
+div
+compare
+where
+minimum
+maximum
+```
+
+可以逐步共享一套 broadcasting infrastructure。
+
+**这是架构升级。**
+
+---
+
+# 3. NaN semantics：这次确实补得比较认真
+
+上次我特别指出：
+
+```cpp
+std::min
+_mm256_min_ps
+```
+
+不能简单等价于 `np.minimum` 的 NaN propagation。
+
+现在你增加了：
+
+```cpp
+nan_minimum()
+nan_maximum()
+```
+
+以及：
+
+```text
+AVX2 nan_min_ps/nan_max_ps
+AVX512 nan-aware paths
+```
+
+显式检查 NaN 并传播。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/include/litenp/litenp.hpp)
+
+这说明现在优化目标已经从：
+
+> “只让正常 float benchmark 快”
+
+变成：
+
+> “SIMD fast path 也要满足 API semantics”。
+
+这是很关键的成熟度提升。
+
+---
+
+# 4. 测试体系是这次最大的一次工程升级
+
+这一点我甚至认为比多加几十个 operator 更重要。
+
+现在 CI 不只有：
+
+```text
+C++ unit test
+```
+
+而是有：
+
+```text
+Linux GCC
+Linux Clang
+macOS Clang
+Windows MSVC
+
+Debug
+Release
+
+ASan
+UBSan
+
+NumPy oracle
+
+random differential oracle
+    seed 20261008
+    seed 12345
+    seed 99
+
+libtorch oracle
+
+OpenMP build
+CBLAS build
+native arch build
+
+install + downstream consume
+``` :chatgpt-content-reference{index="5"}
+
+
+这已经很接近我上次建议的：
+
+> Unit + Differential + Sanitizer + Platform Matrix + Packaging
+
+体系了。
+
+尤其我很赞同：
+
+```text
+litenp
+   ↕
+NumPy behavioral oracle
+```
+
+而不是只靠人工写 expected value。
+
+---
+
+# 5. Random differential test 方向是对的
+
+现在的 `test_differential.py` 已经随机生成：
+
+- shape
+- dtype
+- NaN
+- empty arrays
+- broadcasting
+- slicing
+
+并逐项跟 NumPy 对结果。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/tests/test_differential.py)
+
+固定 oracle 里也已经加入：
+
+- negative-step slice
+- mixed dtype
+- broadcasting
+- NaN comparison
+- `broadcast_to`
+- `cumsum`
+
+等测试。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/tests/test_numpy_oracle.py)
+
+所以我对 correctness 信心已经从上次的：
+
+**约 5/10**
+
+提高到现在：
+
+**7.5–8/10**
+
+但为什么不是 9？
+
+下面几个问题比较重要。
+
+---
+
+# 6. P0 问题一：negative stride 当前设计我不建议保留
+
+这是现在我认为**最值得优先改掉的地方**。
+
+你的：
+
+```cpp
+using Shape = std::vector<std::size_t>;
+```
+
+然后：
+
+```cpp
+Shape strides_;
+```
+
+也就是说：
+
+> stride 是 unsigned。 [GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/include/litenp/litenp.hpp)
+
+
+为了支持：
+
+```python
+a[::-1]
+```
+
+现在的实现是：
+
+```cpp
+out_strides[axis] =
+    static_cast<std::size_t>(
+        static_cast<std::ptrdiff_t>(strides_[axis]) * step);
+```
+
+注释直接写：
+
+> Store negative stride as two's complement unsigned [GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/include/litenp/litenp.hpp)
+
+
+这在机器层面很聪明，但在 C++ array/pointer semantics 上很危险。
+
+---
+
+## 举个简单例子
+
+假设：
+
+```text
+stride = -1
+```
+
+你保存为：
+
+```text
+size_t = 18446744073709551615
+```
+
+然后：
+
+```cpp
+offset += index[i] * strides[i];
+
+data_[offset]
+```
+
+从 CPU 地址 arithmetic 看，可能最终 wrap 回前一个地址。
+
+但从 **C++ abstract machine** 看：
+
+```cpp
+data_ + 18446744073709551615
+```
+
+不是合法地表达：
+
+```cpp
+data_ - 1
+```
+
+我不会把这种行为作为 production ndarray view 的基础。
+
+---
+
+## 而且会污染 alias detection
+
+你的 overlap 判断现在是：
+
+```cpp
+max_offset += (shape[axis]-1) * strides[axis];
+```
+
+然后：
+
+```cpp
+end = begin + max_offset
+``` :chatgpt-content-reference{index="10"}
+
+
+如果 stride 是 unsigned wrapping 的负数，这里的：
+
+```text
+max_reachable_offset
+```
+
+含义就已经不成立了。
+
+---
+
+# 正确的架构
+
+建议现在就改。
+
+不要再：
+
+```cpp
+using Shape = vector<size_t>;
+
+Shape shape;
+Shape strides;
+```
+
+而是：
+
+```cpp
+using Shape   = std::vector<std::size_t>;
+using Strides = std::vector<std::ptrdiff_t>;
+```
+
+并且：
+
+```cpp
+std::ptrdiff_t offset_for_index(...)
+```
+
+最终：
+
+```cpp
+data_ + signed_offset
+```
+
+那么：
+
+```text
++3
++1
+0
+-1
+-3
+```
+
+都是 C++ 意义上真正的 stride。
+
+---
+
+## overlap 也应该改成
+
+计算：
+
+\[
+minOffset
+\]
+
+和：
+
+\[
+maxOffset
+\]
+
+而不是只有：
+
+```text
+max_reachable_offset
+```
+
+例如负 stride：
+
+```text
+data pointer → logical first element
+
+min_offset = -10
+max_offset = 0
+```
+
+这样：
+
+```text
+memory range
+```
+
+才真正正确。
+
+### 优先级
+
+**P0。**
+
+我甚至建议：
+
+> 在 signed stride 重构之前，不要继续深挖 view API。
+
+因为：
+
+```text
+transpose
+slice
+broadcast
+as_contiguous
+alias
+into
+```
+
+最后全都会依赖它。
+
+---
+
+# 7. P0 问题二：`broadcast_to` 还有一个 rank 边界 bug
+
+现在代码：
+
+```cpp
+const std::size_t shift =
+    shape.size() >= a.ndim()
+    ? shape.size() - a.ndim()
+    : 0;
+
+for (std::size_t i = 0; i < a.ndim(); ++i) {
+    const std::size_t out_dim = shape[i + shift];
+``` :chatgpt-content-reference{index="11"}
+
+
+看起来正常。
+
+但考虑：
+
+```text
+input shape  = (1,3)
+target shape = (3)
+```
+
+即：
+
+```text
+a.ndim()    = 2
+shape.size() = 1
+```
+
+于是：
+
+```text
+shift = 0
+```
+
+循环：
+
+```text
+i=0 -> shape[0]
+i=1 -> shape[1]   ← 越界
+```
+
+正确行为应该是在开始就：
+
+```cpp
+require(
+    shape.size() >= a.ndim(),
+    "cannot broadcast to lower-rank shape"
+);
+```
+
+NumPy broadcasting 不能通过删除原 tensor 的轴来完成。
+
+这个 bug 很小，修复可能只有一行。
+
+但属于：
+
+> **memory safety / API correctness**
+
+所以也是 P0。
+
+---
+
+# 8. dtype promotion 已经进步很多，但目前还不能叫“NumPy-compatible”
+
+这是我这次第二个比较明显的发现。
+
+你已经不再单纯用：
+
+```cpp
+std::common_type
+```
+
+了，而是自己建立：
+
+```text
+dtype kind
++
+bits
++
+promote_impl
+``` :chatgpt-content-reference{index="12"}
+
+
+这是正确方向。
+
+但是文档现在写的是：
+
+> NumPy-compatible `promote_type` :chatgpt-content-reference{index="13"}
+
+
+目前还不能完全这么说。
+
+---
+
+## 例子 1：`int64 + uint64`
+
+你的规则：
+
+```text
+signed + unsigned
+unsigned_bits = 64
+signed_bits   = 64
+
+result_kind = signed
+result_bits = min(64*2, 64)
+            = 64
+
+→ int64
+```
+
+但是 NumPy：
+
+```text
+int64 + uint64
+→ float64
+```
+
+原因是没有任何 signed 64-bit integer 能覆盖完整的 `uint64` + `int64` value range。NumPy 当前官方 promotion 文档也明确把 `int64 + uint64 → float64` 列作特殊情况。[NumPy](https://numpy.org/devdocs/reference/arrays.promotion.html?utm_source=chatgpt.com)
+
+所以这里要加 special case。
+
+---
+
+# 9. `true_divide` / `/` 的整数语义仍然不是 NumPy
+
+现在同 dtype：
+
+```cpp
+template <typename T>
+Array<T> divide(...)
+```
+
+直接返回：
+
+```cpp
+Array<T>
+``` :chatgpt-content-reference{index="15"}
+
+
+因此：
+
+```cpp
+Array<int32_t> a;
+Array<int32_t> b;
+
+auto c = divide(a,b);
+```
+
+仍然是：
+
+```text
+int32 / int32
+→ int32
+```
+
+NumPy 的：
+
+```python
+np.array([1], dtype=np.int32) /
+np.array([2], dtype=np.int32)
+```
+
+结果应该是 floating point。
+
+NumPy 官方规则明确：
+
+> Division always returns floating point values. [NumPy](https://numpy.org/devdocs/reference/arrays.promotion.html?utm_source=chatgpt.com)
+
+
+所以这里有两个选择。
+
+### 如果目标真的是 NumPy-like
+
+那么：
+
+```cpp
+true_divide<int,int>
+```
+
+至少返回：
+
+```text
+double
+```
+
+或者定义明确的 NumPy dtype mapping。
+
+### 如果你不想增加这种复杂性
+
+那也可以。
+
+但文档应该明确：
+
+> arithmetic division follows C++ semantics for integral arrays.
+
+不要同时写：
+
+> NumPy-compatible.
+
+---
+
+# 10. differential test 的 dtype coverage 还不够发现这些 bug
+
+这解释了为什么 CI 很强，但上面的问题还存在。
+
+当前随机 dtype 只有：
+
+```python
+f32
+f64
+i32
+``` :chatgpt-content-reference{index="17"}
+
+
+没有：
+
+```text
+uint8
+int8
+uint16
+int16
+uint32
+int64
+uint64
+```
+
+搜索随机测试，也没有 `uint64` coverage。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/tests/test_differential.py)
+
+所以：
+
+```text
+int64 + uint64
+uint32 + int32
+uint64 + float32
+uint8 overflow
+integer divide
+integer reductions
+```
+
+目前很容易漏过去。
+
+---
+
+# 我建议下一步马上建立 dtype matrix test
+
+不是随机任选 dtype。
+
+而是先做完整笛卡尔表：
+
+```text
+          u8 i8 u16 i16 u32 i32 u64 i64 f32 f64
+u8
+i8
+u16
+i16
+u32
+i32
+u64
+i64
+f32
+f64
+```
+
+一共：
+
+\[
+10\times10 = 100
+\]
+
+种组合。
+
+对每个：
+
+```text
+add
+subtract
+multiply
+divide
+minimum
+maximum
+comparison
+```
+
+直接运行：
+
+```python
+np.result_type()
+```
+
+和 litenp 返回 type 对比。
+
+这才真正有资格写：
+
+> NumPy-compatible dtype promotion.
+
+---
+
+# 11. Benchmark：依然是当前项目最弱的一环
+
+correctness 这次提升很明显。
+
+但 benchmark 的核心问题**基本还没修**。
+
+例如：
+
+```cpp
+auto a = Array<float>({n}, 1.25f);
+auto b = Array<float>({n}, 2.75f);
+
+add_into(a,b,out);
+``` :chatgpt-content-reference{index="19"}
+
+
+这两个输入依然是：
+
+```text
+uniform metadata
+```
+
+而不是 random dense data。
+
+所以虽然 README 仍然把：
+
+```text
+add 4M
+```
+
+列在：
+
+> Materialized dense rows
+
+里面，并显示对 NumPy / Torch 的倍率。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/README.md)
+
+但 methodology 又定义：
+
+> `add` 属于 materialized dense kernel。 [GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/docs/benchmark_methodology.md)
+
+
+这还是存在分类问题。
+
+---
+
+# 12. 应该把 benchmark 改成明确的三组
+
+例如 `add`：
+
+### A. Dense random
+
+```cpp
+A = random()
+B = random()
+
+add_into(A,B,C)
+```
+
+测试：
+
+> 真正 memory-bandwidth-bound add kernel。
+
+---
+
+### B. Dense patterned
+
+```cpp
+A[i] = i % 17
+B[i] = i % 13
+```
+
+方便 deterministic reproduction。
+
+---
+
+### C. Structured
+
+```cpp
+A = full(...,1.25)
+B = full(...,2.75)
+```
+
+测试：
+
+> semantic structure optimization。
+
+然后 README 写：
+
+| workload | litenp | NumPy |
+|---|---:|---:|
+| dense random add | xxx | xxx |
+| patterned add | xxx | xxx |
+| structured uniform add | xxx | xxx |
+
+这样 benchmark 会非常有说服力。
+
+---
+
+# 13. Matmul benchmark 也依然没有回答 generic GEMM 问题
+
+现在 benchmark 还是：
+
+```cpp
+A = full(..., 1.0f)
+B = full(..., 0.5f)
+
+matmul(A,B)
+``` :chatgpt-content-reference{index="22"}
+
+
+这种数据非常适合你的 structure-aware shortcut。
+
+这没问题。
+
+而且 methodology 已经正确提醒：
+
+> uniform matmul 不是 generic GEMM throughput。 :chatgpt-content-reference{index="23"}
+
+
+但是还应该补：
+
+```text
+random 64x64
+random 128x128
+random 256x256
+random 512x512
+random 1024x1024
+```
+
+比较：
+
+```text
+LiteNP native kernel
+LiteNP + CBLAS
+Eigen
+OpenBLAS
+NumPy
+Torch
+```
+
+这样我才能真正评价：
+
+> 你的 GEMM kernel 到底处在哪一个层级。
+
+---
+
+# 14. `BroadcastPlan` 还有下一层性能优化空间
+
+现在结构正确了。
+
+但是 generic N-D fallback 仍然大量：
+
+```cpp
+linear_to_index()
+```
+
+而 `linear_to_index()` 对每个元素都需要按维度做：
+
+```cpp
+%
+/
+``` :chatgpt-content-reference{index="24"}
+
+
+这意味着 generic broadcasting 大概是：
+
+\[
+O(N\times ndim)
+\]
+
+并且包含整数 modulo/division。
+
+正确性阶段这样完全可以。
+
+下一步性能阶段我建议换成：
+
+### multidimensional odometer
+
+维护：
+
+```text
+idx[ndim]
+lhs_offset
+rhs_offset
+```
+
+每个元素只：
+
+```text
+offset += stride
+```
+
+到维度末尾再 reset。
+
+这样可以避免每元素：
+
+```text
+linear -> multi-index
+```
+
+转换。
+
+---
+
+# 15. 我现在对这个 branch 的重新评分
+
+与上一次 `main` 相比：
+
+| 项目 | 上次 | 当前 branch |
+|---|---:|---:|
+| 基础架构 | 7 | **8** |
+| Core API | 6 | **7.5** |
+| Broadcasting correctness | 4 | **8.5** |
+| Reduction correctness | 5 | **8.5** |
+| NaN semantics | 5 | **8.5** |
+| dtype semantics | 4 | **6.5** |
+| View/stride architecture | 6 | **5.5** ↓ |
+| Differential testing | 3 | **8.5** |
+| CI / 工程化 | 4 | **9** |
+| Dense benchmark可信度 | 5 | **5.5** |
+| Structure-aware 特色 | **9** | **9** |
+| Production readiness | 3–4 | **6.5–7** |
+
+为什么 stride architecture 反而下调？
+
+不是代码退步。
+
+而是：
+
+> 现在支持 negative stride 后，原来 `size_t stride` 隐藏的设计问题正式暴露出来了。
+
+以前没有负 stride，`size_t` 没问题。
+
+现在它成为架构债务。
+
+---
+
+# 16. 现在我会修改之前的 Roadmap
+
+我上次建议：
+
+```text
+P0 correctness
+P1 benchmark
+P2 Core API
+P3 kernels
+P4 structure aware
+...
+```
+
+这个分支之后，**P0 大部分已经完成**。
+
+新的近期计划我会压缩成：
+
+### P0 — 收掉 4 个 correctness blocker
+
+1. **`Strides = vector<ptrdiff_t>`**
+2. `broadcast_to` target rank guard
+3. 完整 dtype promotion table
+4. integer `/` / `true_divide` semantics
+
+其中第 1 个最重要。
+
+---
+
+### P1 — 扩 differential testing
+
+加入：
+
+```text
+uint8
+int8
+uint16
+int16
+uint32
+int64
+uint64
+float32
+float64
+```
+
+重点 fuzz：
+
+```text
+dtype × dtype
+shape × broadcasting
+stride ±
+NaN/Inf
+empty
+axis
+alias
+```
+
+并把：
+
+```text
+broadcast_to
+cumsum
+```
+
+也放入随机 differential，而不只是 fixed oracle。
+
+目前它们在固定 oracle 有覆盖，但随机 differential 文件中没有直接覆盖。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/tests/test_numpy_oracle.py)
+
+---
+
+### P2 — 重建 benchmark
+
+至少拆：
+
+```text
+Dense-random
+Dense-patterned
+Structured
+```
+
+特别补：
+
+```text
+random add
+random broadcast
+random matmul
+non-contiguous input
+mixed dtype
+```
+
+之后再更新 README 的 2026-05-27 benchmark；当前 README 仍然展示的是那次旧 snapshot。[GitHub](https://raw.githubusercontent.com/a554142589/litenp/trae/agent-Gu4z5u-fix/README.md)
+
+---
+
+### P3 — 再谈性能
+
+到这里以后：
+
+```text
+broadcast odometer
+SIMD
+NEON
+AVX dispatch
+GEMM
+fusion
+memory planner
+```
+
+才值得大投入。
+
+---
+
+# 17. 如果这是一个 PR，我的 review 结论
+
+我不会再给：
+
+> ❌ 整体思路不成熟。
+
+相反，我现在会给：
+
+> **Request changes — mostly architecture edge cases**
+
+而且范围已经非常具体。
+
+### 我会直接 approve 的
+
+- ✅ `cumsum` 重写
+- ✅ multidimensional `broadcast_to` 基本实现
+- ✅ `BroadcastPlan`
+- ✅ NaN-propagating min/max
+- ✅ NumPy oracle
+- ✅ randomized differential framework
+- ✅ ASan/UBSan CI
+- ✅ GCC/Clang/MSVC/macOS matrix
+- ✅ install/consumer test
+
+### Merge 前希望修改的
+
+- 🔴 negative stride 不要用 unsigned two's-complement hack
+- 🔴 `broadcast_to` lower-rank guard
+- 🟠 修/限制“NumPy-compatible dtype promotion”表述
+- 🟠 integer division 语义
+
+### 可以 merge 后跟进的
+
+- 🟡 benchmark random dense 分组
+- 🟡 random GEMM
+- 🟡 wider dtype fuzz
+- 🟡 broadcast odometer optimization
+
+---
+
+## 最重要的判断
+
+这次优化以后，我会改变之前对项目阶段的定义：
+
+**旧版：**
+
+> 有亮点的高性能 header-only ndarray prototype。
+
+**这个 branch：**
+
+> **已经开始形成可靠工程基础的 lightweight CPU tensor runtime，距离 production candidate 主要差的是 stride/dtype 两个底层语义收口，而不是再缺一堆 API。**
+
+所以现在**不要继续疯狂加函数**。
+
+下一轮最有价值的工作不是：
+
+```text
+再增加 30 个 np.xxx
+```
+
+而是把这四个点彻底打穿：
+
+> **signed stride → dtype matrix → dense benchmark → structure-aware propagation**
+
+做完这一轮，我认为就可以开始谈 **`litenp 1.0` 的冻结边界**，而不是继续把它当实验库。

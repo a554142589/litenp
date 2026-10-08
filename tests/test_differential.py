@@ -257,6 +257,39 @@ def gen_astype_cases(rng: random.Random, n: int):
     return cases
 
 
+def gen_broadcast_to_cases(rng: random.Random, n: int):
+    """Random broadcast_to: build a target shape broadcastable from the input
+    by replacing some size-1 axes with larger dims."""
+    cases = []
+    for i in range(n):
+        tag = rng.choice(["f32", "f64"])
+        ndim = rng.randint(1, 3)
+        in_shape = list(rand_shape(rng, ndim=ndim, allow_empty=False))
+        # zero out axes of size 1 (broadcast-friendly) but keep rank
+        in_shape = [1 if (rng.random() < 0.4 and d != 0) else d for d in in_shape]
+        target = list(in_shape)
+        for j in range(len(target)):
+            if target[j] == 1 and rng.random() < 0.6:
+                target[j] = rng.randint(2, 6)
+        arr = rand_array(rng, tag, tuple(in_shape), nan_prob=0.05)
+        cases.append(("broadcast_to", tag, arr, tuple(target)))
+    return cases
+
+
+def gen_cumsum_cases(rng: random.Random, n: int):
+    cases = []
+    for i in range(n):
+        tag = rng.choice(["f32", "f64", "i32"])
+        shape = rand_shape(rng, allow_empty=False, ndim=2)
+        arr = rand_array(rng, tag, shape,
+                         nan_prob=0.05 if is_float(tag) else 0.0,
+                         int_range=4)
+        # litenp cumsum requires an explicit axis (no axis-less overload yet).
+        axis = rng.randint(0, len(shape) - 1)
+        cases.append(("cumsum", tag, arr, axis))
+    return cases
+
+
 # ---------------------------------------------------------------------------
 # C++ harness generation
 # ---------------------------------------------------------------------------
@@ -410,6 +443,32 @@ def astype_cpp(idx: int, case) -> str:
     ))
 
 
+def broadcast_to_cpp(idx: int, case) -> str:
+    _, tag, arr, target = case
+    na = f"bt{idx}"
+    ty = cpp_name(tag)
+    da = make_array_decl(na, tag, arr)
+    tshape = shape_cpp(target)
+    return wrap_try(idx, da + (
+        f'    emit("case_{idx}", broadcast_to<{ty}>({na}.view(), {tshape}));\n'
+    ))
+
+
+def cumsum_cpp(idx: int, case) -> str:
+    _, tag, arr, axis = case
+    na = f"cs{idx}"
+    ty = cpp_name(tag)
+    da = make_array_decl(na, tag, arr)
+    if axis is None:
+        return wrap_try(idx, da + (
+            f'    emit("case_{idx}", cumsum<{ty}>({na}));\n'
+        ))
+    else:
+        return wrap_try(idx, da + (
+            f'    emit("case_{idx}", cumsum<{ty}>({na}, {int(axis)}));\n'
+        ))
+
+
 # ---------------------------------------------------------------------------
 # NumPy oracle for each case
 # ---------------------------------------------------------------------------
@@ -470,6 +529,16 @@ def np_slice(arr, axis, begin, end, step):
 
 def np_astype(arr, target):
     return arr.astype(np_dtype(target))
+
+
+def np_broadcast_to(arr, target):
+    return np.broadcast_to(arr, target).copy()
+
+
+def np_cumsum(arr, axis):
+    if axis is None:
+        return np.cumsum(arr, axis=None)
+    return np.cumsum(arr, axis=axis)
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +624,8 @@ def main() -> None:
     reduce = gen_reduction_cases(rng, CASES)
     slc = gen_slice_cases(rng, CASES)
     astype = gen_astype_cases(rng, CASES)
+    bcast_to = gen_broadcast_to_cases(rng, CASES)
+    cumsum_cases = gen_cumsum_cases(rng, CASES)
 
     # build C++ source (global case index across all categories)
     parts = [CPP_HEADER]
@@ -573,6 +644,10 @@ def main() -> None:
         parts.append(slice_cpp(idx, c)); idx += 1
     for c in astype:
         parts.append(astype_cpp(idx, c)); idx += 1
+    for c in bcast_to:
+        parts.append(broadcast_to_cpp(idx, c)); idx += 1
+    for c in cumsum_cases:
+        parts.append(cumsum_cpp(idx, c)); idx += 1
     parts.append(CPP_FOOTER)
     source = "".join(parts)
 
@@ -711,6 +786,20 @@ def main() -> None:
         check_array_thunk(f"case_{n0 + i}",
                           lambda arr=arr, target=target: np_astype(arr, target),
                           nan_safe=is_float(target))
+
+    n0 += len(astype)
+    for i, c in enumerate(bcast_to):
+        _, tag, arr, target = c
+        check_array_thunk(f"case_{n0 + i}",
+                          lambda arr=arr, target=target: np_broadcast_to(arr, target),
+                          nan_safe=True)
+
+    n0 += len(bcast_to)
+    for i, c in enumerate(cumsum_cases):
+        _, tag, arr, axis = c
+        check_array_thunk(f"case_{n0 + i}",
+                          lambda arr=arr, axis=axis: np_cumsum(arr, axis),
+                          nan_safe=is_float(tag))
 
     if failures:
         print(f"\n{failures}/{total} differential checks FAILED")

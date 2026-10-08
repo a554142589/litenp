@@ -30,8 +30,13 @@
 - **L3 行为 Oracle**：编译小 C++ 程序调用 litenp，将输出与 NumPy / libtorch 逐元素比对，形成**双基线**：
   - `tests/test_numpy_oracle.py` —— 固定用例，覆盖每个公开算子的代表性输入（含 NaN 传播、负步长切片、广播、`cumsum`）。
   - `tests/test_differential.py` —— property-based 随机 differential，每轮按 seed 生成随机
-    shape/dtype/NaN/empty/广播/负步长切片输入，逐算子对比 NumPy，或匹配 NumPy 抛出的异常
-    （如空 `max`/`mean`）。可由 `SEED=` 与 `CASES=` 覆盖，CI 矩阵化多 seed 运行。
+    shape/dtype/NaN/empty/广播/负步长切片/`broadcast_to`/`cumsum` 输入，逐算子对比 NumPy，
+    或匹配 NumPy 抛出的异常（如空 `max`/`mean`、`broadcast_to` 低秩目标）。
+    可由 `SEED=` 与 `CASES=` 覆盖，CI 矩阵化多 seed 运行。
+  - `tests/test_dtype_matrix.py` —— dtype 提升矩阵测试，笛卡尔 10×10 组合
+    （u8/i8/u16/i16/u32/i32/u64/i64/f32/f64），逐对验证
+    `detail::promote_type<A,B>` 与 `np.result_type(A,B)` 一致（含
+    `int64+uint64→float64` 逃逸规则）。
   - `tests/test_libtorch_oracle.py` —— libtorch 基线。
 - **L4 性能基准**：`benchmarks/bench_litenp.cpp`（含 Eigen / libtorch 可选基线）+
   `benchmarks/bench_numpy.py`，由 `tools/compare_benchmarks.py` 生成 pass/fail 报告。
@@ -62,7 +67,7 @@
 | --- | :-: | :-: | :-: | :-: | --- |
 | `reshape` / `flatten` | ✓ | ✓ | ✓ | ✓ | |
 | `transpose` / `permute` | ✓ | ✓ | ✓ | ✓ | |
-| `slice`（含正/负 step、`SLICE_OPEN` 省略边界） / `select` | ✓ | ✓ | ✓ | ✓ | |
+| `slice`（含正/负 step、`SLICE_OPEN` 省略边界） / `select` | ✓ | ✓ | ✓ | ✓ | 步幅为有符号 `Strides=vector<ptrdiff_t>`，负步幅由 `data_ + ptrdiff_t` 实现合法指针运算 |
 | `squeeze` / `unsqueeze` | ✓ | ✓ | ✓ | — | |
 | `as_contiguous` | ✓ | ✓ | ✓ | ✓ | |
 | `shape` / `strides` / `ndim` / `size` | ✓ | — | ✓ | ✓ | |
@@ -118,15 +123,21 @@
 1. **空数组**：`Array<float>()`、`{0,3}`、`{2,0}`；`sum` 返回 0，`mean`/`max` 抛异常。
 2. **零维广播**：标量与数组、`{1}` 与 `{n}`、`{m,1}` 与 `{1,n}`。
 3. **NaN 传播**：比较算子对 NaN 返回 0（`equal`）/1（`not_equal`）；`min`/`max` 行为。
-4. **别名安全**：`*_into` 输出与输入重叠（`slice` 偏移）时结果正确。
-5. **形状不匹配**：二元算子广播失败抛 `invalid_argument`。
+4. **别名安全**：`*_into` 输出与输入重叠（`slice` 偏移）时结果正确。别名检测用
+   有符号 min/max 偏移区间，支持负步幅视图。
+5. **形状不匹配**：二元算子广播失败抛 `invalid_argument`；`broadcast_to` 对低秩目标
+   （input ndim > target ndim）抛 `invalid_argument`。
 6. **极端尺寸**：`16M` 元素稠密核、`2048²` 归约与转置、`1024` 矩阵乘。
 7. **非均匀数据**：`arange` / 随机模式输入，避免结构感知捷径掩盖稠密核缺陷。
 8. **步长切片**：`slice(axis, begin, end, step)`，含 `step>1`、负 step 反向切片，
-   以及 `litenp::SLICE_OPEN` 省略 `begin`/`end`（Python 风格）。
-9. **类型提升**：`int32 + float` → `double`（NumPy 兼容 `promote_type`，kind+bits 规则）；
-   `astype<float>(int_array)`。
-10. **视图生命周期**：源 Array 析构后视图不可用（文档约束，测试中显式避免）。
+   以及 `litenp::SLICE_OPEN` 省略 `begin`/`end`（Python 风格）。步幅为有符号
+   `ptrdiff_t`，负步幅经 `data_ + ptrdiff_t` 实现合法指针运算（非 unsigned 补码 hack）。
+9. **类型提升**：`int32 + float` → `double`、`int64 + uint64` → `double`、
+   `int32 + uint32` → `int64`（NumPy 兼容 `promote_type`，kind+bits 规则，100 对
+   dtype 笛卡尔矩阵全过 `np.result_type`）；`astype<float>(int_array)`。
+10. **除法语义**：`divide` 对整数遵循 C++ 截断语义；`true_divide` 对整数提升为
+    `double`（对齐 NumPy `np.true_divide`）。
+11. **视图生命周期**：源 Array 析构后视图不可用（文档约束，测试中显式避免）。
 
 ## 5. 容差与对齐约定
 
@@ -191,10 +202,13 @@
    python3 tests/test_differential.py            # SEED=20261008 CASES=64
    SEED=12345 python3 tests/test_differential.py  # 多 seed 回归
 
-4. L3 libtorch Oracle（需已安装 PyTorch）
+4. L3 Dtype Promotion Matrix（10×10 笛卡尔组合 vs np.result_type）
+   python3 tests/test_dtype_matrix.py
+
+5. L3 libtorch Oracle（需已安装 PyTorch）
    python3 tests/test_libtorch_oracle.py
 
-5. L4 性能基准（含 libtorch + Eigen 基线）
+6. L4 性能基准（含 libtorch + Eigen 基线）
    cmake -S . -B build_perf -DCMAKE_BUILD_TYPE=Release \
      -DLITENP_BUILD_BENCHMARKS=ON -DLITENP_USE_OPENMP=ON \
      -DLITENP_USE_CBLAS=ON -DLITENP_NATIVE_ARCH=ON \
@@ -207,7 +221,7 @@
    python3 tools/compare_benchmarks.py --manifest benchmarks/benchmark_manifest.json \
      --cpp /tmp/cpp.txt --numpy /tmp/numpy.json --out /tmp/report.md
 
-6. L5 Sanitizer
+7. L5 Sanitizer
    cmake -S . -B build_asan -DCMAKE_BUILD_TYPE=Debug \
      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
    cmake --build build_asan -j
@@ -219,8 +233,8 @@
 全量测试通过需同时满足：
 
 1. `ctest`（Release + Debug + ASan/UBSan）全部通过。
-2. `test_numpy_oracle.py`、`test_differential.py`（至少 1 个 seed）与
-   `test_libtorch_oracle.py` 全部通过。
+2. `test_numpy_oracle.py`、`test_differential.py`（至少 1 个 seed）、
+   `test_dtype_matrix.py` 与 `test_libtorch_oracle.py` 全部通过。
 3. `compare_benchmarks.py` 报告 `pass >= 68` 且 `fail == 0`、`uncovered == 0`。
 4. CI 矩阵（§6.1）全部 job 通过（含 `differential-oracle` 多 seed 矩阵）。
 5. API 覆盖矩阵（§3）中所有算子在 L3 层至少有一个 oracle 用例。

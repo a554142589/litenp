@@ -96,6 +96,20 @@ jobs:
           CXX: g++
           SEED: ${{ matrix.seed }}
 
+  # ---- L3: exhaustive dtype promotion matrix (100 pairs vs np.result_type) ----
+  dtype-matrix:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NumPy
+        run: python3 -m pip install --upgrade pip numpy
+
+      - name: Run Dtype Promotion Matrix (g++)
+        run: python3 tests/test_dtype_matrix.py
+        env:
+          CXX: g++
+
   # ---- L3: libtorch behavioral oracle ----
   libtorch-oracle:
     runs-on: ubuntu-22.04

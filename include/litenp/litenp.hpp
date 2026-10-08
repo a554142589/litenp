@@ -49,6 +49,12 @@ extern "C" {
 namespace litenp {
 
 using Shape = std::vector<std::size_t>;
+// Strides are signed element counts. A negative stride traverses an axis
+// backwards (e.g. slice with step<0, or reversed permute). Signed strides
+// keep C++ pointer arithmetic well-defined: `data_ + ptrdiff_t_offset` is
+// legal for negative offsets, whereas an unsigned two's-complement hack
+// (`size_t = -1`) is undefined as pointer arithmetic.
+using Strides = std::vector<std::ptrdiff_t>;
 
 template <typename T>
 class Array;
@@ -86,12 +92,25 @@ struct dtype_from_meta {
 template <typename A, typename B>
 struct promote_impl {
 private:
-    static constexpr int ka = dtype_meta<A>::kind;
+    static constexpr int ka = dtype_meta<A>::kind;   // 0=unsigned, 1=signed, 2=float
     static constexpr int kb = dtype_meta<B>::kind;
     static constexpr int ba = dtype_meta<A>::bits;
     static constexpr int bb = dtype_meta<B>::bits;
 
-    static constexpr int result_kind = (ka > kb) ? ka : kb;
+    // bits of the signed / unsigned operand when mixing integer kinds
+    static constexpr int signed_part_bits   = (ka == 1) ? ba : bb;
+    static constexpr int unsigned_part_bits = (ka == 0) ? ba : bb;
+
+    // Any signed+unsigned mix where the unsigned operand is 64-bit escapes to
+    // floating point: no signed integer type can hold the full uint64 value
+    // range plus the signed range (NumPy rule). Smaller unsigned widths widen
+    // to a signed integer instead (int32+uint32 -> int64, int8+uint8 -> int16).
+    static constexpr bool needs_float_escape =
+        (ka != 2 && kb != 2 && ka != kb &&
+         unsigned_part_bits >= 64);
+
+    static constexpr int result_kind =
+        needs_float_escape ? 2 : ((ka > kb) ? ka : kb);
 
     static constexpr int compute_bits() {
         if (ka == 2 && kb == 2) {
@@ -106,18 +125,20 @@ private:
         if (ka == kb) {
             return (ba > bb) ? ba : bb;
         }
-        const int unsigned_bits = (ka == 0) ? ba : bb;
-        const int signed_bits = (ka == 1) ? ba : bb;
-        if (signed_bits > unsigned_bits) {
-            return signed_bits;
+        // mixed signed/unsigned integers.
+        if (signed_part_bits > unsigned_part_bits) {
+            return signed_part_bits;
         }
-        return (unsigned_bits * 2 > 64) ? 64 : unsigned_bits * 2;
+        return (unsigned_part_bits * 2 > 64) ? 64 : unsigned_part_bits * 2;
     }
 
     static constexpr int result_bits = compute_bits();
 
 public:
-    using type = typename dtype_from_meta<result_kind, result_bits>::type;
+    using type = typename std::conditional<
+        needs_float_escape,
+        std::conditional_t<result_bits <= 32, float, double>,
+        typename dtype_from_meta<result_kind, result_bits>::type>::type;
 };
 
 template <typename A, typename B>
@@ -273,13 +294,13 @@ inline std::size_t checked_product(const Shape& shape) {
     return total;
 }
 
-inline Shape contiguous_strides(const Shape& shape) {
-    Shape strides(shape.size(), 1);
+inline Strides contiguous_strides(const Shape& shape) {
+    Strides strides(shape.size(), 1);
     if (shape.empty()) {
         return strides;
     }
     for (std::size_t i = shape.size() - 1; i > 0; --i) {
-        strides[i - 1] = strides[i] * shape[i];
+        strides[i - 1] = strides[i] * static_cast<std::ptrdiff_t>(shape[i]);
     }
     return strides;
 }
@@ -423,16 +444,16 @@ inline void touch_uniform_sample(const T* data, std::size_t n) {
     (void)sink;
 }
 
-inline bool is_contiguous(const Shape& shape, const Shape& strides) {
+inline bool is_contiguous(const Shape& shape, const Strides& strides) {
     if (shape.size() != strides.size()) {
         return false;
     }
-    std::size_t expected = 1;
+    std::ptrdiff_t expected = 1;
     for (std::size_t axis = shape.size(); axis-- > 0;) {
         if (strides[axis] != expected) {
             return false;
         }
-        expected *= shape[axis];
+        expected *= static_cast<std::ptrdiff_t>(shape[axis]);
     }
     return true;
 }
@@ -450,10 +471,10 @@ inline void linear_to_index(std::size_t linear, const Shape& shape, Shape& index
     }
 }
 
-inline std::size_t offset_for_index(const Shape& index, const Shape& strides) {
-    std::size_t offset = 0;
+inline std::ptrdiff_t offset_for_index(const Shape& index, const Strides& strides) {
+    std::ptrdiff_t offset = 0;
     for (std::size_t i = 0; i < index.size(); ++i) {
-        offset += index[i] * strides[i];
+        offset += static_cast<std::ptrdiff_t>(index[i]) * strides[i];
     }
     return offset;
 }
@@ -481,36 +502,36 @@ inline Shape broadcast_shape(const Shape& a, const Shape& b) {
     return result;
 }
 
-inline std::size_t broadcast_offset(
+inline std::ptrdiff_t broadcast_offset(
     const Shape& out_index,
     const Shape& out_shape,
     const Shape& in_shape,
-    const Shape& in_strides) {
+    const Strides& in_strides) {
     if (in_shape.empty()) {
         return 0;
     }
     const std::size_t shift = out_shape.size() - in_shape.size();
-    std::size_t offset = 0;
+    std::ptrdiff_t offset = 0;
     for (std::size_t axis = 0; axis < in_shape.size(); ++axis) {
         const std::size_t idx = in_shape[axis] == 1 ? 0 : out_index[axis + shift];
-        offset += idx * in_strides[axis];
+        offset += static_cast<std::ptrdiff_t>(idx) * in_strides[axis];
     }
     return offset;
 }
 
 struct BroadcastPlan {
     Shape output_shape;
-    Shape lhs_strides;
-    Shape rhs_strides;
+    Strides lhs_strides;
+    Strides rhs_strides;
 
     static BroadcastPlan make(
-        const Shape& a_shape, const Shape& a_strides,
-        const Shape& b_shape, const Shape& b_strides)
+        const Shape& a_shape, const Strides& a_strides,
+        const Shape& b_shape, const Strides& b_strides)
     {
         const std::size_t ndim = std::max(a_shape.size(), b_shape.size());
         Shape output_shape(ndim, 1);
-        Shape lhs_strides(ndim, 0);
-        Shape rhs_strides(ndim, 0);
+        Strides lhs_strides(ndim, 0);
+        Strides rhs_strides(ndim, 0);
 
         for (std::size_t i = 0; i < ndim; ++i) {
             const std::size_t ar = ndim - i;
@@ -531,12 +552,12 @@ struct BroadcastPlan {
     }
 };
 
-inline std::size_t broadcast_offset_fast(
-    const Shape& out_index, const Shape& bcast_strides)
+inline std::ptrdiff_t broadcast_offset_fast(
+    const Shape& out_index, const Strides& bcast_strides)
 {
-    std::size_t offset = 0;
+    std::ptrdiff_t offset = 0;
     for (std::size_t i = 0; i < out_index.size(); ++i) {
-        offset += out_index[i] * bcast_strides[i];
+        offset += static_cast<std::ptrdiff_t>(out_index[i]) * bcast_strides[i];
     }
     return offset;
 }
@@ -4299,10 +4320,10 @@ public:
 
     ArrayView() : shape_{0}, strides_{1} {}
 
-    ArrayView(T* data, Shape shape, Shape strides)
+    ArrayView(T* data, Shape shape, Strides strides)
         : ArrayView(data, std::move(shape), std::move(strides), data) {}
 
-    ArrayView(T* data, Shape shape, Shape strides, T* base_data)
+    ArrayView(T* data, Shape shape, Strides strides, T* base_data)
         : data_(data), base_data_(base_data), shape_(std::move(shape)), strides_(std::move(strides)) {
         detail::require(shape_.size() == strides_.size(), "shape/stride rank mismatch");
     }
@@ -4340,7 +4361,7 @@ public:
         return shape_;
     }
 
-    const Shape& strides() const {
+    const Strides& strides() const {
         return strides_;
     }
 
@@ -4356,7 +4377,7 @@ public:
         return detail::is_contiguous(shape_, strides_);
     }
 
-    std::size_t offset(const Shape& index) const {
+    std::ptrdiff_t offset(const Shape& index) const {
         detail::require(index.size() == shape_.size(), "index rank mismatch");
         for (std::size_t axis = 0; axis < index.size(); ++axis) {
             if (index[axis] >= shape_[axis]) {
@@ -4406,14 +4427,19 @@ public:
             detail::require(begin <= end, "invalid slice range");
 
             Shape out_shape = shape_;
-            Shape out_strides = strides_;
+            Strides out_strides = strides_;
             out_shape[axis] = static_cast<std::size_t>((end - begin + step - 1) / step);
-            out_strides[axis] *= static_cast<std::size_t>(step);
-            return ArrayView<T>(data_ + static_cast<std::size_t>(begin) * strides_[axis],
+            out_strides[axis] = strides_[axis] * step;
+            // Positive step: data pointer advances forward by a non-negative offset.
+            return ArrayView<T>(data_ + begin * strides_[axis],
                                  std::move(out_shape), std::move(out_strides), base_data_);
         }
 
-        // Negative step: traverse backwards
+        // Negative step: traverse backwards. The logical first element is at
+        // `begin`, and the (signed) stride is negative, so subsequent indices
+        // move to lower addresses. `data_ + begin * stride` is well-defined
+        // pointer arithmetic even though the stride product is negative, as
+        // long as the resulting pointer stays within the live buffer.
         if (begin_open) begin = dim - 1;
         else { if (begin < 0) begin += dim; if (begin >= dim) begin = dim - 1; if (begin < 0) begin = 0; }
         if (end_open) end = -1;
@@ -4421,12 +4447,10 @@ public:
 
         const std::ptrdiff_t count = (begin - end + (-step) - 1) / (-step);
         Shape out_shape = shape_;
-        Shape out_strides = strides_;
+        Strides out_strides = strides_;
         out_shape[axis] = static_cast<std::size_t>(count > 0 ? count : 0);
-        // Store negative stride as two's complement unsigned (wraps correctly in offset computation)
-        out_strides[axis] = static_cast<std::size_t>(
-            static_cast<std::ptrdiff_t>(strides_[axis]) * step);
-        return ArrayView<T>(data_ + static_cast<std::size_t>(begin) * strides_[axis],
+        out_strides[axis] = strides_[axis] * step;  // genuinely negative, no two's-complement hack
+        return ArrayView<T>(data_ + begin * strides_[axis],
                              std::move(out_shape), std::move(out_strides), base_data_);
     }
 
@@ -4434,21 +4458,22 @@ public:
         detail::require(axis < ndim(), "select axis out of range");
         detail::require(index < shape_[axis], "select index out of range");
         Shape out_shape = shape_;
-        Shape out_strides = strides_;
+        Strides out_strides = strides_;
         out_shape.erase(out_shape.begin() + static_cast<std::ptrdiff_t>(axis));
         out_strides.erase(out_strides.begin() + static_cast<std::ptrdiff_t>(axis));
         if (out_shape.empty()) {
             out_shape.push_back(1);
             out_strides.push_back(1);
         }
-        return ArrayView<T>(data_ + index * strides_[axis], std::move(out_shape), std::move(out_strides), base_data_);
+        return ArrayView<T>(data_ + static_cast<std::ptrdiff_t>(index) * strides_[axis],
+                            std::move(out_shape), std::move(out_strides), base_data_);
     }
 
     ArrayView<T> permute(const Shape& axes) const {
         detail::require(axes.size() == ndim(), "permute rank mismatch");
         std::vector<bool> seen(ndim(), false);
         Shape out_shape(ndim());
-        Shape out_strides(ndim());
+        Strides out_strides(ndim());
         for (std::size_t i = 0; i < axes.size(); ++i) {
             const std::size_t axis = axes[i];
             detail::require(axis < ndim(), "permute axis out of range");
@@ -4470,7 +4495,7 @@ public:
 
     ArrayView<T> squeeze() const {
         Shape out_shape;
-        Shape out_strides;
+        Strides out_strides;
         for (std::size_t axis = 0; axis < ndim(); ++axis) {
             if (shape_[axis] != 1) {
                 out_shape.push_back(shape_[axis]);
@@ -4488,7 +4513,7 @@ public:
         detail::require(axis < ndim(), "squeeze axis out of range");
         detail::require(shape_[axis] == 1, "squeeze axis must have size 1");
         Shape out_shape = shape_;
-        Shape out_strides = strides_;
+        Strides out_strides = strides_;
         out_shape.erase(out_shape.begin() + static_cast<std::ptrdiff_t>(axis));
         out_strides.erase(out_strides.begin() + static_cast<std::ptrdiff_t>(axis));
         if (out_shape.empty()) {
@@ -4501,8 +4526,9 @@ public:
     ArrayView<T> unsqueeze(std::size_t axis) const {
         detail::require(axis <= ndim(), "unsqueeze axis out of range");
         Shape out_shape = shape_;
-        Shape out_strides = strides_;
-        const std::size_t stride = axis < ndim() ? strides_[axis] * shape_[axis] : 1;
+        Strides out_strides = strides_;
+        const std::ptrdiff_t stride =
+            axis < ndim() ? strides_[axis] * static_cast<std::ptrdiff_t>(shape_[axis]) : 1;
         out_shape.insert(out_shape.begin() + static_cast<std::ptrdiff_t>(axis), 1);
         out_strides.insert(out_strides.begin() + static_cast<std::ptrdiff_t>(axis), stride);
         return ArrayView<T>(data_, std::move(out_shape), std::move(out_strides), base_data_);
@@ -4512,23 +4538,39 @@ private:
     T* data_ = nullptr;
     T* base_data_ = nullptr;
     Shape shape_;
-    Shape strides_;
+    Strides strides_;
     mutable bool metadata_invalidated_ = false;
 };
 
 namespace detail {
 
-inline std::size_t max_reachable_offset(const Shape& shape, const Shape& strides) {
+// For overlap detection we need the signed min/max reachable offset, because a
+// view may carry negative strides (reverse slice). The data pointer points at
+// the logical first element; negative strides reach *below* it. The memory
+// range touched by a view is [data + min_offset, data + max_offset].
+struct OffsetRange {
+    std::ptrdiff_t min_offset;
+    std::ptrdiff_t max_offset;
+};
+
+inline OffsetRange offset_range(const Shape& shape, const Strides& strides) {
     if (checked_product(shape) == 0) {
-        return 0;
+        return {0, 0};
     }
-    std::size_t max_offset = 0;
+    std::ptrdiff_t min_off = 0;
+    std::ptrdiff_t max_off = 0;
     for (std::size_t axis = 0; axis < shape.size(); ++axis) {
         if (shape[axis] > 0) {
-            max_offset += (shape[axis] - 1) * strides[axis];
+            const std::ptrdiff_t extent =
+                static_cast<std::ptrdiff_t>(shape[axis] - 1) * strides[axis];
+            if (extent >= 0) {
+                max_off += extent;
+            } else {
+                min_off += extent;
+            }
         }
     }
-    return max_offset;
+    return {min_off, max_off};
 }
 
 template <typename A, typename B>
@@ -4541,11 +4583,15 @@ inline bool memory_may_overlap(ArrayView<A> a, ArrayView<B> b) {
         if (a.data() == nullptr || b.data() == nullptr || a.size() == 0 || b.size() == 0) {
             return false;
         }
+        const auto a_range = offset_range(a.shape(), a.strides());
+        const auto b_range = offset_range(b.shape(), b.strides());
         const auto a_begin = reinterpret_cast<std::uintptr_t>(a.data());
         const auto b_begin = reinterpret_cast<std::uintptr_t>(b.data());
-        const auto a_end = a_begin + (max_reachable_offset(a.shape(), a.strides()) + 1) * sizeof(AT);
-        const auto b_end = b_begin + (max_reachable_offset(b.shape(), b.strides()) + 1) * sizeof(BT);
-        return a_begin < b_end && b_begin < a_end;
+        const auto a_lo = a_begin + static_cast<std::uintptr_t>(a_range.min_offset) * sizeof(AT);
+        const auto a_hi = a_begin + static_cast<std::uintptr_t>(a_range.max_offset) * sizeof(AT) + (sizeof(AT) - 1);
+        const auto b_lo = b_begin + static_cast<std::uintptr_t>(b_range.min_offset) * sizeof(BT);
+        const auto b_hi = b_begin + static_cast<std::uintptr_t>(b_range.max_offset) * sizeof(BT) + (sizeof(BT) - 1);
+        return a_lo <= b_hi && b_lo <= a_hi;
     }
 }
 
@@ -4774,7 +4820,7 @@ public:
         return shape_;
     }
 
-    const Shape& strides() const {
+    const Strides& strides() const {
         return strides_;
     }
 
@@ -5034,7 +5080,7 @@ private:
     }
 
     Shape shape_;
-    Shape strides_;
+    Strides strides_;
     mutable storage_type storage_;
     mutable bool virtual_uniform_ = false;
     mutable bool virtual_arange_ = false;
@@ -6134,7 +6180,27 @@ template <typename T> Array<T> hypot(ArrayView<const T> a, ArrayView<const T> b)
 template <typename T> Array<T> arctan2(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Arctan2); }
 template <typename T> Array<T> logaddexp(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Logaddexp); }
 template <typename T> Array<T> floor_divide(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::FloorDiv); }
-template <typename T> Array<T> true_divide(ArrayView<const T> a, ArrayView<const T> b) { return binary(a, b, detail::BinaryOp::Div); }
+
+// NumPy true_divide: division always yields floating-point. For integral
+// element types the result is promoted to double; for floating types the
+// result keeps the floating type. This differs from `divide`, which follows
+// C++ semantics (int/int -> int truncation) for same-typed integral arrays.
+namespace detail {
+template <typename T>
+struct true_divide_result { using type = std::conditional_t<std::is_integral<T>::value, double, T>; };
+}
+template <typename T>
+Array<typename detail::true_divide_result<T>::type>
+true_divide(ArrayView<const T> a, ArrayView<const T> b) {
+    using R = typename detail::true_divide_result<T>::type;
+    return binary<T, T, R>(a, b, detail::BinaryOp::Div);
+}
+template <typename A, typename B, typename R = detail::promote_type<A, B>, typename = std::enable_if_t<!std::is_same<A, B>::value>>
+Array<std::conditional_t<std::is_integral<R>::value, double, R>>
+true_divide(ArrayView<const A> a, ArrayView<const B> b) {
+    using RR = std::conditional_t<std::is_integral<R>::value, double, R>;
+    return binary<A, B, RR>(a, b, detail::BinaryOp::Div);
+}
 
 template <typename T> Array<T> mod(const Array<T>& a, const Array<T>& b) { return mod<T>(a.view(), b.view()); }
 template <typename T> Array<T> remainder(const Array<T>& a, const Array<T>& b) { return remainder<T>(a.view(), b.view()); }
@@ -6143,7 +6209,7 @@ template <typename T> Array<T> hypot(const Array<T>& a, const Array<T>& b) { ret
 template <typename T> Array<T> arctan2(const Array<T>& a, const Array<T>& b) { return arctan2<T>(a.view(), b.view()); }
 template <typename T> Array<T> logaddexp(const Array<T>& a, const Array<T>& b) { return logaddexp<T>(a.view(), b.view()); }
 template <typename T> Array<T> floor_divide(const Array<T>& a, const Array<T>& b) { return floor_divide<T>(a.view(), b.view()); }
-template <typename T> Array<T> true_divide(const Array<T>& a, const Array<T>& b) { return true_divide<T>(a.view(), b.view()); }
+template <typename T> Array<typename detail::true_divide_result<T>::type> true_divide(const Array<T>& a, const Array<T>& b) { return true_divide<T>(a.view(), b.view()); }
 
 template <typename T>
 Array<T> add(const Array<T>& a, const Array<T>& b) {
@@ -7681,8 +7747,14 @@ template <typename T> Array<T> repeat(const Array<T>& a, std::size_t repeats) { 
 
 template <typename T>
 Array<T> broadcast_to(ArrayView<const T> a, const Shape& shape) {
+    // NumPy broadcasting cannot reduce rank: the target shape must have at
+    // least as many axes as the input. A lower-rank target would otherwise
+    // index `shape[i + shift]` out of bounds below.
+    if (shape.size() < a.ndim()) {
+        throw std::invalid_argument("cannot broadcast to lower-rank shape");
+    }
     // Validate broadcast compatibility
-    const std::size_t shift = shape.size() >= a.ndim() ? shape.size() - a.ndim() : 0;
+    const std::size_t shift = shape.size() - a.ndim();
     for (std::size_t i = 0; i < a.ndim(); ++i) {
         const std::size_t out_dim = shape[i + shift];
         const std::size_t in_dim = a.shape()[i];
@@ -7693,11 +7765,11 @@ Array<T> broadcast_to(ArrayView<const T> a, const Shape& shape) {
     Array<T> out = detail::make_uninitialized_array<T>(shape);
     const T* d = a.data();
     const Shape& in_shape = a.shape();
-    const Shape& in_strides = a.strides();
+    const Strides& in_strides = a.strides();
     Shape out_index;
     for (std::size_t linear = 0; linear < out.size(); ++linear) {
         detail::linear_to_index(linear, shape, out_index);
-        const std::size_t offset = detail::broadcast_offset(out_index, shape, in_shape, in_strides);
+        const std::ptrdiff_t offset = detail::broadcast_offset(out_index, shape, in_shape, in_strides);
         out[linear] = d[offset];
     }
     return out;
